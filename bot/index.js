@@ -25,6 +25,7 @@ const db = createClient({
 });
 const runtimeAdminIds = new Set(adminTelegramIds);
 const pendingAdminInputs = new Map();
+const pendingUserInputs = new Map();
 
 const TEXTS = {
   vi: {
@@ -163,6 +164,7 @@ const adminMenu = Markup.inlineKeyboard([
     Markup.button.callback('Them san pham', 'admin_add_product_help'),
     Markup.button.callback('Thong bao theo loai', 'admin_notify_category_help'),
   ],
+  [Markup.button.callback('Cap nhat nhieu SP', 'admin_bulk_update_start')],
 ]);
 
 async function ensureUser(ctx) {
@@ -300,6 +302,55 @@ function parseAddProductPayload(payload) {
       description,
     },
   };
+}
+
+function parseBulkAccountLines(input) {
+  const lines = String(input || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const unique = [];
+  const seen = new Set();
+  for (const line of lines) {
+    if (!seen.has(line)) {
+      seen.add(line);
+      unique.push(line);
+    }
+  }
+  return unique;
+}
+
+function parseBulkProductUpdates(input) {
+  const lines = String(input || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const updates = [];
+  const invalidLines = [];
+
+  for (const line of lines) {
+    const [productId, priceRaw, stockRaw, activeRaw] = line.split('|').map((p) => p.trim());
+    const price = Number(priceRaw);
+    const stock = Number(stockRaw);
+    const hasActive = activeRaw !== undefined && activeRaw !== '';
+    const active = hasActive ? ['1', 'true', 'on', 'active'].includes(String(activeRaw).toLowerCase()) : null;
+
+    if (!productId || !Number.isFinite(price) || !Number.isInteger(stock) || stock < 0) {
+      invalidLines.push(line);
+      continue;
+    }
+
+    updates.push({
+      productId,
+      patch: hasActive
+        ? { price, stock_quantity: stock, is_active: active }
+        : { price, stock_quantity: stock },
+    });
+  }
+
+  return { updates, invalidLines, total: lines.length };
 }
 
 async function getAllUserTelegramIds() {
@@ -446,7 +497,7 @@ async function createProduct(input) {
       slug,
       description: input.description || null,
       delivery_type: 'manual',
-      manual_contact_note: 'Sau khi chuyen khoan thanh cong, vui long nhan admin de duoc cap tai khoan.',
+      manual_contact_note: 'Sau khi chuy\u1ec3n kho\u1ea3n th\u00e0nh c\u00f4ng, vui l\u00f2ng nh\u1eafn admin \u0111\u1ec3 \u0111\u01b0\u1ee3c c\u1ea5p t\u00e0i kho\u1ea3n.',
       price: input.price,
       currency: input.currency || 'VND',
       stock_quantity: input.stock,
@@ -460,6 +511,43 @@ async function createProduct(input) {
   }
 
   return data;
+}
+
+async function addProductAccountsBulk(productId, accountLines) {
+  const lines = parseBulkAccountLines(accountLines);
+  if (lines.length === 0) {
+    return { added: 0, skipped: 0, total: 0 };
+  }
+
+  const { data: existingRows, error: existingError } = await db
+    .from('product_accounts')
+    .select('account_data')
+    .eq('product_id', productId)
+    .limit(5000);
+
+  if (existingError) {
+    throw existingError;
+  }
+
+  const existingSet = new Set((existingRows || []).map((r) => String(r.account_data || '').trim()));
+  const toInsert = lines
+    .filter((line) => !existingSet.has(line))
+    .map((line) => ({ product_id: productId, account_data: line, is_used: false }));
+
+  if (toInsert.length > 0) {
+    const { error: insertError } = await db
+      .from('product_accounts')
+      .insert(toInsert);
+    if (insertError) {
+      throw insertError;
+    }
+  }
+
+  return {
+    added: toInsert.length,
+    skipped: lines.length - toInsert.length,
+    total: lines.length,
+  };
 }
 
 async function claimAutoAccount(productId, orderId) {
@@ -587,8 +675,13 @@ async function getUserTelegramIdsByCategory(categoryId) {
   return [...telegramIdSet];
 }
 
-async function createSingleItemOrder(userId, product) {
-  const total = Number(product.price || 0);
+async function createSingleItemOrder(userId, product, quantity = 1) {
+  const qty = Number(quantity);
+  if (!Number.isInteger(qty) || qty <= 0) {
+    throw new Error('So luong khong hop le');
+  }
+  const unitPrice = calcUnitPriceByQuantity(product.price, qty);
+  const total = unitPrice * qty;
 
   const { data: order, error: orderError } = await db
     .from('orders')
@@ -610,8 +703,8 @@ async function createSingleItemOrder(userId, product) {
     .insert({
       order_id: order.id,
       product_id: product.id,
-      unit_price: total,
-      quantity: 1,
+      unit_price: unitPrice,
+      quantity: qty,
       total_price: total,
     });
 
@@ -622,7 +715,7 @@ async function createSingleItemOrder(userId, product) {
   if (typeof product.stock_quantity === 'number') {
     const { error: stockError } = await db
       .from('products')
-      .update({ stock_quantity: Math.max(product.stock_quantity - 1, 0) })
+      .update({ stock_quantity: Math.max(product.stock_quantity - qty, 0) })
       .eq('id', product.id);
 
     if (stockError) {
@@ -834,6 +927,24 @@ function formatDong(value) {
   return `${formatPriceVnd(value)}\u0111`;
 }
 
+function calcTierPrice(basePrice, ratio) {
+  const base = Number(basePrice || 0);
+  if (!Number.isFinite(base) || base <= 0) {
+    return 0;
+  }
+  return Math.round(base * ratio);
+}
+
+function calcUnitPriceByQuantity(basePrice, quantity) {
+  if (quantity >= 10) {
+    return calcTierPrice(basePrice, 0.8);
+  }
+  if (quantity >= 5) {
+    return calcTierPrice(basePrice, 0.875);
+  }
+  return Math.round(Number(basePrice || 0));
+}
+
 function buildProductDetailPanel(locale, product) {
   const box = '\uD83D\uDCE6';
   const money = '\uD83D\uDCB0';
@@ -918,27 +1029,45 @@ async function sendCataloguePanel(ctx, locale, shouldEdit = false) {
   await ctx.reply(text, keyboard);
 }
 
-async function processPurchase(ctx, user, locale, product) {
-  if (typeof product.stock_quantity === 'number' && product.stock_quantity <= 0) {
+async function processPurchase(ctx, user, locale, product, quantity = 1) {
+  const qty = Number(quantity);
+  if (!Number.isInteger(qty) || qty <= 0) {
+    await safeReply(ctx, locale === 'en' ? 'Invalid quantity.' : 'So luong khong hop le.');
+    return;
+  }
+
+  if (typeof product.stock_quantity === 'number' && product.stock_quantity < qty) {
     await safeReply(ctx, t(locale, 'outOfStock'));
     return;
   }
 
-  const order = await createSingleItemOrder(user.id, product);
+  const order = await createSingleItemOrder(user.id, product, qty);
+  const unitPrice = calcUnitPriceByQuantity(product.price, qty);
   const message = t(locale, 'orderCreated', {
     id: order.id,
     total: order.total_amount,
     currency: order.currency || 'VND',
   });
 
-  await ctx.reply(message);
+  await ctx.reply(`${message}\nSo luong: ${qty}\nDon gia: ${unitPrice} ${order.currency || 'VND'}`);
 
   if (product.delivery_type === 'auto') {
-    const account = await claimAutoAccount(product.id, order.id);
-    if (account?.account_data) {
+    const accounts = [];
+    for (let i = 0; i < qty; i += 1) {
+      const account = await claimAutoAccount(product.id, order.id);
+      if (!account?.account_data) {
+        break;
+      }
+      accounts.push(account.account_data);
+    }
+
+    if (accounts.length > 0) {
       await ctx.reply(
-        `Tai khoan cua ban (dinh dang tk|mk|2fa):\\n${account.account_data}\\n\\nLuu y: Doi mat khau ngay sau khi nhan.`,
+        `Tai khoan cua ban (${accounts.length}/${qty}) - dinh dang tk|mk|2fa:\n${accounts.map((a, idx) => `${idx + 1}. ${a}`).join('\n')}\n\nLuu y: Doi mat khau ngay sau khi nhan.`,
       );
+      if (accounts.length < qty) {
+        await ctx.reply('Con thieu mot so tai khoan auto. Vui long nhan admin de duoc cap bo sung.');
+      }
     } else {
       await ctx.reply(
         'Tam het tai khoan auto. Vui long nhan admin de duoc cap bo sung sau khi chuyen khoan thanh cong.',
@@ -955,7 +1084,7 @@ async function processPurchase(ctx, user, locale, product) {
 
 function adminProductsListText(products) {
   const lines = products.map((p) => {
-    const status = p.is_active ? 'active' : 'inactive';
+    const status = p.is_active ? 'dang ban' : 'tam an';
     return `- ${p.name} | ${p.price} ${p.currency || 'VND'} | ton:${p.stock_quantity ?? '-'} | ${status}`;
   });
 
@@ -964,7 +1093,7 @@ function adminProductsListText(products) {
     '',
     ...lines,
     '',
-    'Chon san pham de sua/xoa hoac bam Them moi.',
+    'Chon san pham de sua / xoa / them tai khoan auto.',
   ].join('\n');
 }
 
@@ -977,9 +1106,10 @@ function buildAdminProductsKeyboard(products) {
 
   rows.push([
     Markup.button.callback('Them moi', 'admin_add_product_start'),
-    Markup.button.callback('Cap nhat', 'admin_products_refresh'),
+    Markup.button.callback('Lam moi', 'admin_products_refresh'),
   ]);
-  rows.push([Markup.button.callback('Xoa panel', 'admin_products_close')]);
+  rows.push([Markup.button.callback('Cap nhat nhieu SP', 'admin_bulk_update_start')]);
+  rows.push([Markup.button.callback('Dong', 'admin_products_close')]);
 
   return Markup.inlineKeyboard(rows);
 }
@@ -988,17 +1118,19 @@ function adminProductDetailText(product) {
   return [
     `SAN PHAM: ${product.name}`,
     `Gia: ${product.price} ${product.currency || 'VND'}`,
-    `Ton: ${product.stock_quantity ?? '-'}`,
-    `Trang thai: ${product.is_active ? 'active' : 'inactive'}`,
+    `Ton kho: ${product.stock_quantity ?? '-'}`,
+    `Trang thai: ${product.is_active ? 'dang ban' : 'tam an'}`,
+    `Kieu giao: ${product.delivery_type === 'auto' ? 'auto' : 'thu cong'}`,
     '',
-    'Tac vu: Sua gia, sua ton, bat/tat, xoa.',
+    'Tac vu nhanh: Sua gia, sua ton, bat/tat, them TK auto.',
   ].join('\n');
 }
 
 function adminProductDetailKeyboard(product) {
   const toggleTo = product.is_active ? '0' : '1';
   return Markup.inlineKeyboard([
-    [Markup.button.callback(product.is_active ? 'Tat san pham' : 'Mo san pham', `prdtg:${product.id}:${toggleTo}`)],
+    [Markup.button.callback(product.is_active ? 'Tam an san pham' : 'Mo ban lai', `prdtg:${product.id}:${toggleTo}`)],
+    [Markup.button.callback('Them TK auto (nhieu dong)', `admaddacc:${product.id}`)],
     [
       Markup.button.callback('Sua gia', `admsetprice:${product.id}`),
       Markup.button.callback('Sua ton', `admsetstock:${product.id}`),
@@ -1331,6 +1463,28 @@ bot.command('addproduct', async (ctx) => {
   );
 });
 
+bot.action('admin_bulk_update_start', async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  if (!isAdmin(ctx, user)) {
+    await ctx.answerCbQuery(t(locale, 'noAdmin'), { show_alert: true });
+    return;
+  }
+
+  setPendingAdminInput(ctx, { type: 'bulk_update_products' });
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    'Nhap danh sach cap nhat nhieu san pham (moi dong 1 san pham):\n'
+    + 'product_id|gia|ton|active(0/1)\n'
+    + 'active la tuy chon.\n\n'
+    + 'Vi du:\n'
+    + '1111-2222|99000|20|1\n'
+    + '3333-4444|49000|5|0\n'
+    + '5555-6666|150000|10\n\n'
+    + 'Nhap /cancel de huy.',
+  );
+});
+
 bot.command('notifycat', async (ctx) => {
   const user = await ensureUser(ctx);
   const locale = getLocale(user);
@@ -1413,16 +1567,22 @@ bot.action(/^prd:(.+)$/, async (ctx) => {
 
   const details = buildProductDetailPanel(locale, product);
   await ctx.reply(details, Markup.inlineKeyboard([
-    [Markup.button.callback('\uD83D\uDCB3 VietQR', `payqr:${product.id}`)],
+    [
+      Markup.button.callback('Mua x1', `buyq:${product.id}:1`),
+      Markup.button.callback('Mua x3', `buyq:${product.id}:3`),
+      Markup.button.callback('Mua x5', `buyq:${product.id}:5`),
+    ],
+    [Markup.button.callback('Nhap so luong', `buyqinput:${product.id}`)],
     [Markup.button.callback('\uD83D\uDDD1 X\u00f3a', 'prd_close')],
   ]));
 });
 
-bot.action(/^payqr:(.+)$/, async (ctx) => {
+bot.action(/^buyq:(.+):(\d+)$/, async (ctx) => {
   const user = await ensureUser(ctx);
   const locale = getLocale(user);
   const productId = ctx.match[1];
-  await ctx.answerCbQuery('VietQR');
+  const quantity = Number(ctx.match[2] || 1);
+  await ctx.answerCbQuery(`x${quantity}`);
 
   const product = await loadProduct(productId);
   if (!product) {
@@ -1430,7 +1590,23 @@ bot.action(/^payqr:(.+)$/, async (ctx) => {
     return;
   }
 
-  await processPurchase(ctx, user, locale, product);
+  await processPurchase(ctx, user, locale, product, quantity);
+});
+
+bot.action(/^buyqinput:(.+)$/, async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  const productId = ctx.match[1];
+  const product = await loadProduct(productId);
+  if (!product) {
+    await ctx.answerCbQuery('Not found');
+    await safeReply(ctx, t(locale, 'productMissing'));
+    return;
+  }
+
+  pendingUserInputs.set(String(ctx.from.id), { type: 'buy_quantity', productId });
+  await ctx.answerCbQuery();
+  await ctx.reply(`Nhap so luong can mua cho "${product.name}" (so nguyen >= 1).`);
 });
 
 bot.action('prd_close', async (ctx) => {
@@ -1453,7 +1629,7 @@ bot.action(/^buy:(.+)$/, async (ctx) => {
     return;
   }
 
-  await processPurchase(ctx, user, locale, product);
+  await processPurchase(ctx, user, locale, product, 1);
 });
 bot.action('menu_history', async (ctx) => {
   const user = await ensureUser(ctx);
@@ -1606,13 +1782,13 @@ bot.action('admin_products', async (ctx) => {
   const products = await loadAdminProducts();
 
   if (products.length === 0) {
-    await ctx.reply('Chua co san pham.');
+    await ctx.reply('Ch\u01b0a c\u00f3 s\u1ea3n ph\u1ea9m.');
     return;
   }
 
   for (const product of products) {
     const nextActive = product.is_active ? '0' : '1';
-    const text = `${product.name} | ${product.price} ${product.currency || 'VND'} | ton:${product.stock_quantity ?? '-'} | ${product.is_active ? 'active' : 'inactive'}`;
+    const text = `${product.name} | ${product.price} ${product.currency || 'VND'} | ton:${product.stock_quantity ?? '-'} | ${product.is_active ? 'dang ban' : 'tam an'}`;
     await ctx.reply(
       text,
       Markup.inlineKeyboard([
@@ -1643,7 +1819,7 @@ bot.action(/^prdtg:(.+):(0|1)$/, async (ctx) => {
   }
 
   await ctx.answerCbQuery('OK');
-  await ctx.reply(`San pham ${productId} -> ${target ? 'active' : 'inactive'}`);
+  await ctx.reply(`San pham ${productId} -> ${target ? 'dang ban' : 'tam an'}`);
 });
 
 bot.action('admin_products_v2', async (ctx) => {
@@ -1730,6 +1906,32 @@ bot.action(/^admsetprice:(.+)$/, async (ctx) => {
   );
 });
 
+bot.action(/^admaddacc:(.+)$/, async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  if (!isAdmin(ctx, user)) {
+    await ctx.answerCbQuery(t(locale, 'noAdmin'), { show_alert: true });
+    return;
+  }
+
+  const productId = ctx.match[1];
+  const product = await loadProductAny(productId);
+  if (!product) {
+    await ctx.answerCbQuery('Not found');
+    return;
+  }
+
+  setPendingAdminInput(ctx, { type: 'add_accounts', productId });
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    `Nhap danh sach tai khoan AUTO cho "${product.name}" (moi dong 1 tai khoan, dinh dang tu do).\n`
+    + 'Vi du:\n'
+    + 'email1@gmail.com|MatKhau123|2FA:ABCD-EFGH\n'
+    + 'email2@gmail.com|MatKhau456\n\n'
+    + 'Nhap /cancel de huy.',
+  );
+});
+
 bot.action(/^admsetstock:(.+)$/, async (ctx) => {
   const user = await ensureUser(ctx);
   const locale = getLocale(user);
@@ -1775,11 +1977,41 @@ bot.action(/^admdelete:(.+)$/, async (ctx) => {
   } catch (error) {
     await updateAdminProduct(productId, { is_active: false });
     await ctx.answerCbQuery('Disabled');
-    await ctx.reply(`San pham co lien ket don hang, da chuyen inactive: ${product.name}`);
+    await ctx.reply(`San pham co lien ket don hang, da chuyen tam an: ${product.name}`);
   }
 });
 
 bot.on('text', async (ctx, next) => {
+  const userPending = pendingUserInputs.get(String(ctx.from.id));
+  if (userPending) {
+    const user = await ensureUser(ctx);
+    const locale = getLocale(user);
+    const text = (ctx.message?.text || '').trim();
+    if (/^\/cancel\b/i.test(text)) {
+      pendingUserInputs.delete(String(ctx.from.id));
+      await ctx.reply('Da huy thao tac.');
+      return;
+    }
+
+    if (userPending.type === 'buy_quantity') {
+      const quantity = parseNonNegativeInt(text);
+      if (quantity === null || quantity < 1) {
+        await ctx.reply('So luong khong hop le. Hay nhap so nguyen >= 1.');
+        return;
+      }
+
+      const product = await loadProduct(userPending.productId);
+      pendingUserInputs.delete(String(ctx.from.id));
+      if (!product) {
+        await ctx.reply(t(locale, 'productMissing'));
+        return;
+      }
+
+      await processPurchase(ctx, user, locale, product, quantity);
+      return;
+    }
+  }
+
   const pending = pendingAdminInputs.get(String(ctx.from.id));
   if (!pending) {
     return next();
@@ -1856,6 +2088,55 @@ bot.on('text', async (ctx, next) => {
       clearPendingAdminInput(ctx);
       await ctx.reply(`Da cap nhat ton: ${updated.name} -> ${updated.stock_quantity}`);
       await ctx.reply(adminProductDetailText(updated), adminProductDetailKeyboard(updated));
+      return;
+    }
+
+    if (pending.type === 'bulk_update_products') {
+      const parsed = parseBulkProductUpdates(text);
+      if (parsed.total === 0) {
+        await ctx.reply('Khong co dong hop le. Hay nhap theo mau product_id|gia|ton|active(0/1).');
+        return;
+      }
+
+      let success = 0;
+      let failed = 0;
+      for (const item of parsed.updates) {
+        try {
+          await updateAdminProduct(item.productId, item.patch);
+          success += 1;
+        } catch (error) {
+          failed += 1;
+        }
+      }
+
+      clearPendingAdminInput(ctx);
+      await ctx.reply(
+        `Cap nhat nhieu san pham xong.\n`
+        + `Tong dong: ${parsed.total}\n`
+        + `Hop le: ${parsed.updates.length}\n`
+        + `Thanh cong: ${success}\n`
+        + `That bai: ${failed}\n`
+        + `Sai cu phap: ${parsed.invalidLines.length}`,
+      );
+      await sendAdminProductsPanel(ctx);
+      return;
+    }
+
+    if (pending.type === 'add_accounts') {
+      const product = await loadProductAny(pending.productId);
+      if (!product) {
+        clearPendingAdminInput(ctx);
+        await ctx.reply('Khong tim thay san pham.');
+        return;
+      }
+
+      const result = await addProductAccountsBulk(pending.productId, text);
+      clearPendingAdminInput(ctx);
+      await ctx.reply(
+        `Da xu ly ${result.total} dong cho "${product.name}".\n`
+        + `Them moi: ${result.added}\n`
+        + `Bo qua (trung): ${result.skipped}`,
+      );
       return;
     }
   } catch (error) {

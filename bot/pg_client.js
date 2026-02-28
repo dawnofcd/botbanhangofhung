@@ -41,6 +41,7 @@ class QueryBuilder {
     this.whereValues = [];
     this.orderBy = [];
     this.limitValue = null;
+    this.offsetValue = null;
     this.expectSingle = false;
     this.expectMaybeSingle = false;
   }
@@ -140,6 +141,17 @@ class QueryBuilder {
     return this;
   }
 
+  range(from, to) {
+    const start = Number(from);
+    const end = Number(to);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || end < start || start < 0) {
+      throw new Error('Invalid range() arguments');
+    }
+    this.offsetValue = start;
+    this.limitValue = end - start + 1;
+    return this;
+  }
+
   single() {
     this.expectSingle = true;
     this.expectMaybeSingle = false;
@@ -168,9 +180,16 @@ class QueryBuilder {
 
   buildLimitClause() {
     if (this.limitValue == null || Number.isNaN(this.limitValue)) {
-      return '';
+      if (this.offsetValue == null || Number.isNaN(this.offsetValue)) {
+        return '';
+      }
+      return ` OFFSET ${Math.max(0, this.offsetValue)}`;
     }
-    return ` LIMIT ${Math.max(0, this.limitValue)}`;
+    let sql = ` LIMIT ${Math.max(0, this.limitValue)}`;
+    if (this.offsetValue != null && !Number.isNaN(this.offsetValue)) {
+      sql += ` OFFSET ${Math.max(0, this.offsetValue)}`;
+    }
+    return sql;
   }
 
   normalizeSingle(rows) {
