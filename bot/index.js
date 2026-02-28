@@ -1045,10 +1045,65 @@ function clearPendingAdminInput(ctx) {
   pendingAdminInputs.delete(String(ctx.from.id));
 }
 
+async function registerChatMenuCommands() {
+  const commands = [
+    { command: 'start', description: 'Open main menu' },
+    { command: 'catalogue', description: 'Browse products' },
+    { command: 'history', description: 'View my orders' },
+    { command: 'support', description: 'Contact support' },
+    { command: 'language', description: 'Change language' },
+    { command: 'admin', description: 'Open admin panel' },
+  ];
+
+  await bot.telegram.setMyCommands(commands);
+}
+
 bot.start(async (ctx) => {
   const user = await ensureUser(ctx);
   const locale = getLocale(user);
   await sendHomePanel(ctx, user, locale);
+});
+
+bot.command('catalogue', async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  await sendCataloguePanel(ctx, locale);
+});
+
+bot.command('history', async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  const orders = await loadRecentUserOrders(user.id);
+  if (orders.length === 0) {
+    await ctx.reply(t(locale, 'emptyHistory'));
+    return;
+  }
+
+  const lines = orders.map((o) => `#${o.id} | ${STATUS_LABEL[o.status] || o.status} | ${o.total_amount} ${o.currency || 'VND'}`);
+  await ctx.reply(lines.join('\n'));
+});
+
+bot.command('support', async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  const channels = await loadSupportChannels();
+  if (channels.length === 0) {
+    await ctx.reply(t(locale, 'supportEmpty'));
+    return;
+  }
+
+  const lines = channels.map((c) => `- ${c.name}: ${c.value}`);
+  await ctx.reply(lines.join('\n'));
+});
+
+bot.command('language', async (ctx) => {
+  await ctx.reply(
+    'Chon ngon ngu / Choose language',
+    Markup.inlineKeyboard([
+      [Markup.button.callback('Tieng Viet', 'lang:vi')],
+      [Markup.button.callback('English', 'lang:en')],
+    ]),
+  );
 });
 
 bot.command('admin', async (ctx) => {
@@ -1841,7 +1896,8 @@ bot.catch(async (err, ctx) => {
   console.error('Bot error', err);
 });
 
-bot.launch().then(() => {
+bot.launch().then(async () => {
+  await registerChatMenuCommands();
   console.log('Bot launched.');
 }).catch((err) => {
   console.error('Failed to launch bot', err);
