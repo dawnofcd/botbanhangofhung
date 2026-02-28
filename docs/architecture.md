@@ -1,4 +1,4 @@
-# Architecture overview (Supabase)
+﻿# Architecture overview (PostgreSQL)
 
 ## Vision
 Build a Telegram sales bot with 4 customer actions (Danh muc, Lich su, Ho tro, Ngon ngu) and a separate admin flow (orders, products, reports).
@@ -6,7 +6,7 @@ Build a Telegram sales bot with 4 customer actions (Danh muc, Lich su, Ho tro, N
 ## Runtime
 - Platform: Railway
 - Bot mode: long polling
-- Data: Supabase Cloud (PostgreSQL)
+- Data: PostgreSQL
 
 ## Data model
 - `users`: bot users + role + language
@@ -42,4 +42,3 @@ Seed sample data: `docs/supabase_seed.sql`
 
 ## Constraints
 - Polling mode should run as single instance to avoid update conflicts.
-- For production hardening, replace permissive RLS with stricter policies.

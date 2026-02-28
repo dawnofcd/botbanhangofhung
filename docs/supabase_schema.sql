@@ -1,4 +1,4 @@
--- Supabase schema for Telegram sales bot
+﻿-- PostgreSQL schema for Telegram sales bot
 create extension if not exists pgcrypto;
 
 create table if not exists public.users (
@@ -222,3 +222,4 @@ create policy p_support_read on public.support_channels for select using (is_act
 
 drop policy if exists p_support_write on public.support_channels;
 create policy p_support_write on public.support_channels for all using (true) with check (true);
+

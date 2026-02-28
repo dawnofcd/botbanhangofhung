@@ -2,11 +2,10 @@
 
 const crypto = require('crypto');
 const { Telegraf, Markup } = require('telegraf');
-const { createClient } = require('@supabase/supabase-js');
+const { createClient } = require('./pg_client');
 
 const botToken = process.env.TELEGRAM_TOKEN;
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_ANON_KEY;
+const databaseUrl = process.env.DATABASE_URL;
 const adminSecretKey = process.env.ADMIN_SECRET_KEY || '';
 const adminTelegramIds = new Set(
   (process.env.ADMIN_TELEGRAM_IDS || '')
@@ -15,12 +14,15 @@ const adminTelegramIds = new Set(
     .filter(Boolean),
 );
 
-if (!botToken || !supabaseUrl || !supabaseKey) {
-  throw new Error('TELEGRAM_TOKEN, SUPABASE_URL, and SUPABASE_ANON_KEY must be defined.');
+if (!botToken || !databaseUrl) {
+  throw new Error('TELEGRAM_TOKEN and DATABASE_URL must be defined.');
 }
 
 const bot = new Telegraf(botToken);
-const supabase = createClient(supabaseUrl, supabaseKey);
+const db = createClient({
+  connectionString: databaseUrl,
+  ssl: process.env.PGSSL === 'false' ? false : { rejectUnauthorized: false },
+});
 const runtimeAdminIds = new Set(adminTelegramIds);
 const pendingAdminInputs = new Map();
 
@@ -167,7 +169,7 @@ async function ensureUser(ctx) {
   const telegramId = String(ctx.from.id);
   const roleFromEnv = adminTelegramIds.has(telegramId) ? 'admin' : 'customer';
 
-  const { data: existingUser, error: selectError } = await supabase
+  const { data: existingUser, error: selectError } = await db
     .from('users')
     .select('*')
     .eq('telegram_id', Number(telegramId))
@@ -179,7 +181,7 @@ async function ensureUser(ctx) {
 
   if (existingUser) {
     if (roleFromEnv === 'admin' && existingUser.role !== 'admin') {
-      const { data: updatedUser, error: updateError } = await supabase
+      const { data: updatedUser, error: updateError } = await db
         .from('users')
         .update({ role: 'admin' })
         .eq('id', existingUser.id)
@@ -196,7 +198,7 @@ async function ensureUser(ctx) {
     return existingUser;
   }
 
-  const { data: newUser, error: insertError } = await supabase
+  const { data: newUser, error: insertError } = await db
     .from('users')
     .insert({
       telegram_id: Number(telegramId),
@@ -216,7 +218,7 @@ async function ensureUser(ctx) {
 }
 
 async function setUserLanguage(userId, languageCode) {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('users')
     .update({ language_code: languageCode })
     .eq('id', userId)
@@ -306,7 +308,7 @@ async function getAllUserTelegramIds() {
   const ids = [];
 
   while (true) {
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('users')
       .select('telegram_id')
       .not('telegram_id', 'is', null)
@@ -332,7 +334,7 @@ async function getAllUserTelegramIds() {
 }
 
 async function loadActiveCategories() {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('categories')
     .select('id,name')
     .eq('is_active', true)
@@ -346,7 +348,7 @@ async function loadActiveCategories() {
 }
 
 async function loadAllCategories() {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('categories')
     .select('id,name,is_active')
     .order('name', { ascending: true })
@@ -360,7 +362,7 @@ async function loadAllCategories() {
 }
 
 async function loadCategoryById(categoryId) {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('categories')
     .select('id,name,is_active')
     .eq('id', categoryId)
@@ -374,7 +376,7 @@ async function loadCategoryById(categoryId) {
 }
 
 async function loadProductsByCategory(categoryId) {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('products')
     .select('id,name,description,delivery_type,manual_contact_note,price,currency,stock_quantity,is_active')
     .eq('category_id', categoryId)
@@ -390,7 +392,7 @@ async function loadProductsByCategory(categoryId) {
 }
 
 async function loadActiveProducts(limit = 50) {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('products')
     .select('id,name,price,currency,stock_quantity')
     .eq('is_active', true)
@@ -405,7 +407,7 @@ async function loadActiveProducts(limit = 50) {
 }
 
 async function loadProduct(productId) {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('products')
     .select('id,name,description,delivery_type,manual_contact_note,price,currency,stock_quantity,is_active')
     .eq('id', productId)
@@ -420,7 +422,7 @@ async function loadProduct(productId) {
 }
 
 async function loadProductAny(productId) {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('products')
     .select('id,category_id,name,description,delivery_type,manual_contact_note,price,currency,stock_quantity,is_active')
     .eq('id', productId)
@@ -436,7 +438,7 @@ async function loadProductAny(productId) {
 async function createProduct(input) {
   const slugBase = slugifyName(input.name) || `product-${Date.now()}`;
   const slug = `${slugBase}-${Math.random().toString(36).slice(2, 7)}`;
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('products')
     .insert({
       category_id: input.categoryId,
@@ -461,7 +463,7 @@ async function createProduct(input) {
 }
 
 async function claimAutoAccount(productId, orderId) {
-  const { data: accountRow, error: selectError } = await supabase
+  const { data: accountRow, error: selectError } = await db
     .from('product_accounts')
     .select('id,account_data')
     .eq('product_id', productId)
@@ -478,7 +480,7 @@ async function claimAutoAccount(productId, orderId) {
     return null;
   }
 
-  const { data: lockedRow, error: lockError } = await supabase
+  const { data: lockedRow, error: lockError } = await db
     .from('product_accounts')
     .update({
       is_used: true,
@@ -498,7 +500,7 @@ async function claimAutoAccount(productId, orderId) {
 }
 
 async function getUserTelegramIdsByCategory(categoryId) {
-  const { data: products, error: productsError } = await supabase
+  const { data: products, error: productsError } = await db
     .from('products')
     .select('id')
     .eq('category_id', categoryId)
@@ -515,7 +517,7 @@ async function getUserTelegramIdsByCategory(categoryId) {
 
   const orderIdSet = new Set();
   for (const productChunk of chunkArray(productIds, 200)) {
-    const { data: items, error: itemsError } = await supabase
+    const { data: items, error: itemsError } = await db
       .from('order_items')
       .select('order_id')
       .in('product_id', productChunk)
@@ -539,7 +541,7 @@ async function getUserTelegramIdsByCategory(categoryId) {
 
   const userIdSet = new Set();
   for (const orderChunk of chunkArray(orderIds, 200)) {
-    const { data: orders, error: ordersError } = await supabase
+    const { data: orders, error: ordersError } = await db
       .from('orders')
       .select('user_id')
       .in('id', orderChunk)
@@ -563,7 +565,7 @@ async function getUserTelegramIdsByCategory(categoryId) {
 
   const telegramIdSet = new Set();
   for (const userChunk of chunkArray(userIds, 200)) {
-    const { data: users, error: usersError } = await supabase
+    const { data: users, error: usersError } = await db
       .from('users')
       .select('telegram_id')
       .in('id', userChunk)
@@ -588,7 +590,7 @@ async function getUserTelegramIdsByCategory(categoryId) {
 async function createSingleItemOrder(userId, product) {
   const total = Number(product.price || 0);
 
-  const { data: order, error: orderError } = await supabase
+  const { data: order, error: orderError } = await db
     .from('orders')
     .insert({
       user_id: userId,
@@ -603,7 +605,7 @@ async function createSingleItemOrder(userId, product) {
     throw orderError;
   }
 
-  const { error: itemError } = await supabase
+  const { error: itemError } = await db
     .from('order_items')
     .insert({
       order_id: order.id,
@@ -618,7 +620,7 @@ async function createSingleItemOrder(userId, product) {
   }
 
   if (typeof product.stock_quantity === 'number') {
-    const { error: stockError } = await supabase
+    const { error: stockError } = await db
       .from('products')
       .update({ stock_quantity: Math.max(product.stock_quantity - 1, 0) })
       .eq('id', product.id);
@@ -628,7 +630,7 @@ async function createSingleItemOrder(userId, product) {
     }
   }
 
-  await supabase.from('order_history').insert({
+  await db.from('order_history').insert({
     order_id: order.id,
     changed_by: userId,
     status: 'confirmed',
@@ -655,7 +657,7 @@ async function notifyAdminsNewOrder(orderId, total, currency) {
 }
 
 async function loadRecentUserOrders(userId) {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('orders')
     .select('id,status,total_amount,currency,created_at')
     .eq('user_id', userId)
@@ -670,7 +672,7 @@ async function loadRecentUserOrders(userId) {
 }
 
 async function loadSupportChannels() {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('support_channels')
     .select('name,type,value')
     .eq('is_active', true)
@@ -685,7 +687,7 @@ async function loadSupportChannels() {
 }
 
 async function loadAdminOrders() {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('orders')
     .select('id,user_id,status,total_amount,currency,created_at')
     .in('status', ['draft', 'confirmed'])
@@ -716,7 +718,7 @@ function orderActionKeyboard(orderId, currentStatus) {
 }
 
 async function loadAdminProducts() {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('products')
     .select('id,name,price,currency,stock_quantity,is_active,updated_at')
     .order('updated_at', { ascending: false })
@@ -730,7 +732,7 @@ async function loadAdminProducts() {
 }
 
 async function updateAdminProduct(productId, patch) {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('products')
     .update(patch)
     .eq('id', productId)
@@ -745,7 +747,7 @@ async function updateAdminProduct(productId, patch) {
 }
 
 async function hardDeleteProduct(productId) {
-  const { error } = await supabase
+  const { error } = await db
     .from('products')
     .delete()
     .eq('id', productId);
@@ -762,10 +764,10 @@ async function loadReport() {
     confirmedOrdersResp,
     revenueResp,
   ] = await Promise.all([
-    supabase.from('orders').select('id', { count: 'exact', head: true }),
-    supabase.from('orders').select('id', { count: 'exact', head: true }).eq('status', 'paid'),
-    supabase.from('orders').select('id', { count: 'exact', head: true }).eq('status', 'confirmed'),
-    supabase.from('orders').select('total_amount').eq('status', 'paid').limit(5000),
+    db.from('orders').select('id', { count: 'exact', head: true }),
+    db.from('orders').select('id', { count: 'exact', head: true }).eq('status', 'paid'),
+    db.from('orders').select('id', { count: 'exact', head: true }).eq('status', 'confirmed'),
+    db.from('orders').select('total_amount').eq('status', 'paid').limit(5000),
   ]);
 
   if (totalOrdersResp.error) throw totalOrdersResp.error;
@@ -1144,7 +1146,7 @@ bot.command('claimadmin', async (ctx) => {
   runtimeAdminIds.add(telegramId);
 
   if (user.role !== 'admin') {
-    const { error } = await supabase
+    const { error } = await db
       .from('users')
       .update({ role: 'admin' })
       .eq('id', user.id);
@@ -1498,7 +1500,7 @@ bot.action(/^ordst:(.+):(draft|confirmed|paid|cancelled)$/, async (ctx) => {
   const orderId = ctx.match[1];
   const status = ctx.match[2];
 
-  const { data: updated, error } = await supabase
+  const { data: updated, error } = await db
     .from('orders')
     .update({ status })
     .eq('id', orderId)
@@ -1509,14 +1511,14 @@ bot.action(/^ordst:(.+):(draft|confirmed|paid|cancelled)$/, async (ctx) => {
     throw error;
   }
 
-  await supabase.from('order_history').insert({
+  await db.from('order_history').insert({
     order_id: updated.id,
     changed_by: user.id,
     status,
     comment: 'Updated from admin panel',
   });
 
-  const { data: owner } = await supabase
+  const { data: owner } = await db
     .from('users')
     .select('telegram_id')
     .eq('id', updated.user_id)
@@ -1576,7 +1578,7 @@ bot.action(/^prdtg:(.+):(0|1)$/, async (ctx) => {
   const productId = ctx.match[1];
   const target = ctx.match[2] === '1';
 
-  const { error } = await supabase
+  const { error } = await db
     .from('products')
     .update({ is_active: target })
     .eq('id', productId);
@@ -1847,5 +1849,6 @@ bot.launch().then(() => {
 });
 
 module.exports = bot;
+
 
 

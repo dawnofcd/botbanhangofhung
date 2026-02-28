@@ -1,14 +1,14 @@
-# Tai Nguyen Hero (Railway + Supabase)
+﻿# Tai Nguyen Hero (Railway + PostgreSQL)
 
 ## Goal
-Run Telegram sales bot on Railway (long polling) and store data in Supabase Cloud.
+Run Telegram sales bot on Railway (long polling) and store data in PostgreSQL.
 
 ## Required environment variables
 - `TELEGRAM_TOKEN`
-- `SUPABASE_URL`
-- `SUPABASE_ANON_KEY`
+- `DATABASE_URL`
 
 Optional:
+- `PGSSL` (`true` by default)
 - `ADMIN_TELEGRAM_IDS`
 - `ADMIN_SECRET_KEY`
 - `SEPAY_API_KEY`
@@ -16,8 +16,8 @@ Optional:
 - `SEPAY_ACCOUNT_NO`
 - `SEPAY_BANK_CODE`
 
-## Supabase setup
-1. Open Supabase SQL Editor.
+## Database setup
+1. Open your PostgreSQL SQL console/tool.
 2. Run `docs/supabase_schema.sql`.
 3. Run `docs/supabase_seed.sql`.
 
@@ -31,8 +31,8 @@ Optional:
 2. Railway -> New Project -> Deploy from GitHub repo.
 3. In Railway Variables, set:
    - `TELEGRAM_TOKEN`
-   - `SUPABASE_URL`
-   - `SUPABASE_ANON_KEY`
+   - `DATABASE_URL`
+   - `PGSSL=true` (set `PGSSL=false` only for local non-SSL DB)
    - `ADMIN_TELEGRAM_IDS` (optional)
    - `ADMIN_SECRET_KEY` (optional)
    - `SEPAY_API_KEY` (optional)
@@ -49,4 +49,4 @@ Optional:
 
 ## Notes
 - Keep only one running instance when using long polling.
-- Current RLS policies are permissive for anon-key bot integration; tighten before scaling.
+- SQL file names still use `supabase_*` for backward compatibility, but they are standard PostgreSQL scripts.
