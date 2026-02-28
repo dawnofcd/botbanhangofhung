@@ -7,6 +7,9 @@ const { createClient } = require('./pg_client');
 const botToken = process.env.TELEGRAM_TOKEN;
 const databaseUrl = process.env.DATABASE_URL;
 const adminSecretKey = process.env.ADMIN_SECRET_KEY || '';
+const sepayAccountNo = process.env.SEPAY_ACCOUNT_NO || '';
+const sepayBankCode = process.env.SEPAY_BANK_CODE || '';
+const sepayAccountName = process.env.SEPAY_ACCOUNT_NAME || '';
 const adminTelegramIds = new Set(
   (process.env.ADMIN_TELEGRAM_IDS || '')
     .split(',')
@@ -160,11 +163,6 @@ const adminMenu = Markup.inlineKeyboard([
     Markup.button.callback('Sản phẩm', 'admin_products_v2'),
   ],
   [Markup.button.callback('Thống kê', 'admin_reports')],
-  [
-    Markup.button.callback('Thêm sản phẩm', 'admin_add_product_help'),
-    Markup.button.callback('Fill tồn kho', 'admin_fill_stock_help'),
-  ],
-  [Markup.button.callback('Cập nhật nhiều SP', 'admin_bulk_update_start')],
 ]);
 
 async function ensureUser(ctx) {
@@ -314,85 +312,6 @@ function parseBulkAccountLines(input) {
   return unique;
 }
 
-function parseBulkProductUpdates(input) {
-  const lines = String(input || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const updates = [];
-  const invalidLines = [];
-
-  for (const line of lines) {
-    const [productId, priceRaw, stockRaw, activeRaw] = line.split('|').map((p) => p.trim());
-    const price = Number(priceRaw);
-    const stock = Number(stockRaw);
-    const hasActive = activeRaw !== undefined && activeRaw !== '';
-    const active = hasActive ? ['1', 'true', 'on', 'active'].includes(String(activeRaw).toLowerCase()) : null;
-
-    if (!productId || !Number.isFinite(price) || !Number.isInteger(stock) || stock < 0) {
-      invalidLines.push(line);
-      continue;
-    }
-
-    updates.push({
-      productId,
-      patch: hasActive
-        ? { price, stock_quantity: stock, is_active: active }
-        : { price, stock_quantity: stock },
-    });
-  }
-
-  return { updates, invalidLines, total: lines.length };
-}
-
-function parseAccountUpdatePayload(input) {
-  const text = String(input || '').trim();
-  const sepIndex = text.indexOf('|');
-  if (sepIndex <= 0) {
-    return null;
-  }
-
-  const accountId = text.slice(0, sepIndex).trim();
-  const accountData = text.slice(sepIndex + 1).trim();
-  if (!accountId || !accountData) {
-    return null;
-  }
-
-  return { accountId, accountData };
-}
-
-async function getAllUserTelegramIds() {
-  const pageSize = 500;
-  let from = 0;
-  const ids = [];
-
-  while (true) {
-    const { data, error } = await db
-      .from('users')
-      .select('telegram_id')
-      .not('telegram_id', 'is', null)
-      .range(from, from + pageSize - 1);
-
-    if (error) {
-      throw error;
-    }
-
-    if (!data || data.length === 0) {
-      break;
-    }
-
-    ids.push(...data.map((row) => Number(row.telegram_id)).filter(Boolean));
-    if (data.length < pageSize) {
-      break;
-    }
-
-    from += pageSize;
-  }
-
-  return [...new Set(ids)];
-}
-
 async function loadActiveProducts(limit = 50) {
   const { data, error } = await db
     .from('products')
@@ -527,55 +446,6 @@ async function syncProductStockFromAutoAccounts(productId) {
   return data || { id: productId, stock_quantity: stock };
 }
 
-async function loadProductAccounts(productId, limit = 20) {
-  const { data, error } = await db
-    .from('product_accounts')
-    .select('id,account_data,is_used,created_at,used_at')
-    .eq('product_id', productId)
-    .order('created_at', { ascending: false })
-    .limit(limit);
-
-  if (error) {
-    throw error;
-  }
-
-  return data || [];
-}
-
-async function updateProductAccountData(productId, accountId, accountData) {
-  const { data, error } = await db
-    .from('product_accounts')
-    .update({ account_data: accountData })
-    .eq('id', accountId)
-    .eq('product_id', productId)
-    .eq('is_used', false)
-    .select('id,account_data,is_used')
-    .maybeSingle();
-
-  if (error) {
-    throw error;
-  }
-
-  return data;
-}
-
-async function deleteProductAccount(productId, accountId) {
-  const { data, error } = await db
-    .from('product_accounts')
-    .delete()
-    .eq('id', accountId)
-    .eq('product_id', productId)
-    .eq('is_used', false)
-    .select('id')
-    .maybeSingle();
-
-  if (error) {
-    throw error;
-  }
-
-  return data;
-}
-
 async function claimAutoAccount(productId, orderId) {
   const { data: accountRow, error: selectError } = await db
     .from('product_accounts')
@@ -626,10 +496,11 @@ async function createSingleItemOrder(userId, product, quantity = 1) {
     .insert({
       user_id: userId,
       status: 'confirmed',
+      payment_method: 'sepay',
       total_amount: total,
       currency: product.currency || 'VND',
     })
-    .select('id,status,total_amount,currency')
+    .select('id,status,total_amount,currency,payment_method')
     .single();
 
   if (orderError) {
@@ -677,7 +548,7 @@ async function notifyAdminsNewOrder(orderId, total, currency) {
     return;
   }
 
-  const message = `Đơn mới #${orderId}\\nTổng tiền: ${total} ${currency}`;
+  const message = `Đơn mới #${orderId}\\nTổng tiền: ${total} ${currency}\\nPhương thức: SePay`;
   for (const telegramId of adminIds) {
     try {
       await bot.telegram.sendMessage(telegramId, message);
@@ -700,6 +571,21 @@ async function loadRecentUserOrders(userId) {
   }
 
   return data || [];
+}
+
+async function loadOrderByIdForUser(orderId, userId) {
+  const { data, error } = await db
+    .from('orders')
+    .select('id,user_id,status,total_amount,currency,payment_method')
+    .eq('id', orderId)
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  return data;
 }
 
 async function loadSupportChannels() {
@@ -851,6 +737,58 @@ function formatPriceVnd(value) {
   return n.toLocaleString('vi-VN');
 }
 
+function buildSepayTransferCode(orderId) {
+  const compact = String(orderId || '').replace(/-/g, '').slice(0, 10).toUpperCase();
+  return `DH${compact}`;
+}
+
+function buildVietQrUrl({ bankCode, accountNo, accountName, amount, transferContent }) {
+  if (!bankCode || !accountNo) {
+    return null;
+  }
+
+  const base = `https://img.vietqr.io/image/${encodeURIComponent(bankCode)}-${encodeURIComponent(accountNo)}-compact2.png`;
+  const params = new URLSearchParams();
+  if (Number.isFinite(Number(amount)) && Number(amount) > 0) {
+    params.set('amount', String(Math.round(Number(amount))));
+  }
+  if (transferContent) {
+    params.set('addInfo', transferContent);
+  }
+  if (accountName) {
+    params.set('accountName', accountName);
+  }
+
+  return `${base}?${params.toString()}`;
+}
+
+function buildSepayInstruction(order) {
+  const transferContent = buildSepayTransferCode(order.id);
+  const amount = Number(order.total_amount || 0);
+  const qrUrl = buildVietQrUrl({
+    bankCode: sepayBankCode,
+    accountNo: sepayAccountNo,
+    accountName: sepayAccountName,
+    amount,
+    transferContent,
+  });
+
+  const lines = [
+    'THANH TOAN QUA SEPAY',
+    `Ngan hang: ${sepayBankCode || '(chua cau hinh)'}`,
+    `So tai khoan: ${sepayAccountNo || '(chua cau hinh)'}`,
+    `Chu TK: ${sepayAccountName || '(khong bat buoc)'}`,
+    `So tien: ${formatPriceVnd(amount)} ${order.currency || 'VND'}`,
+    `Noi dung CK: ${transferContent}`,
+  ];
+
+  if (!sepayAccountNo || !sepayBankCode) {
+    lines.push('Luu y: Chua cau hinh SEPAY_ACCOUNT_NO/SEPAY_BANK_CODE trong .env.');
+  }
+
+  return { text: lines.join('\n'), qrUrl, transferContent };
+}
+
 function compactProductButtonLabel(product) {
   const box = '\uD83D\uDCE6';
   const maxNameLength = 36;
@@ -989,6 +927,32 @@ async function processPurchase(ctx, user, locale, product, quantity = 1) {
 
   await ctx.reply(`${message}\nSố lượng: ${qty}\nĐơn giá: ${unitPrice} ${order.currency || 'VND'}`);
 
+  const sepay = buildSepayInstruction(order);
+  if (sepay.qrUrl) {
+    try {
+      await ctx.replyWithPhoto(sepay.qrUrl, {
+        caption: sepay.text,
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('Tôi đã chuyển khoản', `paydone:${order.id}`)],
+        ]),
+      });
+    } catch (error) {
+      await ctx.reply(
+        sepay.text,
+        Markup.inlineKeyboard([
+          [Markup.button.callback('Tôi đã chuyển khoản', `paydone:${order.id}`)],
+        ]),
+      );
+    }
+  } else {
+    await ctx.reply(
+      sepay.text,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('Tôi đã chuyển khoản', `paydone:${order.id}`)],
+      ]),
+    );
+  }
+
   if (product.delivery_type === 'auto') {
     const accounts = [];
     for (let i = 0; i < qty; i += 1) {
@@ -1046,7 +1010,6 @@ function buildAdminProductsKeyboard(products) {
     Markup.button.callback('Thêm mới', 'admin_add_product_start'),
     Markup.button.callback('Làm mới', 'admin_products_refresh'),
   ]);
-  rows.push([Markup.button.callback('Cập nhật nhiều SP', 'admin_bulk_update_start')]);
   rows.push([Markup.button.callback('Đóng', 'admin_products_close')]);
 
   return Markup.inlineKeyboard(rows);
@@ -1061,7 +1024,7 @@ function adminProductDetailText(product) {
     `Kiểu giao: ${product.delivery_type === 'auto' ? 'auto' : 'thủ công'}`,
     '',
     'CRUD: Sửa giá, sửa tồn, bật/tắt, xóa sản phẩm.',
-    'Kho AUTO: thêm 1, thêm nhiều, xem, sửa, xóa tài khoản.',
+    'Kho AUTO: thêm 1 hoặc thêm nhiều tài khoản.',
   ].join('\n');
 }
 
@@ -1072,10 +1035,6 @@ function adminProductDetailKeyboard(product) {
     [
       Markup.button.callback('Thêm 1 TK', `admaddacc1:${product.id}`),
       Markup.button.callback('Thêm nhiều TK', `admaddacc:${product.id}`),
-    ],
-    [
-      Markup.button.callback('Xem kho AUTO', `admviewacc:${product.id}`),
-      Markup.button.callback('Sửa/Xóa TK', `admstockcrud:${product.id}`),
     ],
     [
       Markup.button.callback('Sửa giá', `admsetprice:${product.id}`),
@@ -1209,23 +1168,6 @@ bot.action('menu_admin', async (ctx) => {
 
 
 
-bot.action('admin_add_product_help', async (ctx) => {
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
-    await ctx.answerCbQuery(t(locale, 'noAdmin'), { show_alert: true });
-    return;
-  }
-
-  await ctx.answerCbQuery();
-  await ctx.reply(
-    'Thêm sản phẩm:\n'
-    + '/addproduct <ten>|<gia>|<currency>|<delivery:auto|manual>|<mo_ta>\n'
-    + 'Ví dụ:\n'
-    + '/addproduct Tài khoản Premium|99000|VND|auto|Sử dụng 30 ngày',
-  );
-});
-
 bot.action('admin_add_product_start', async (ctx) => {
   const user = await ensureUser(ctx);
   const locale = getLocale(user);
@@ -1242,26 +1184,6 @@ bot.action('admin_add_product_start', async (ctx) => {
     + 'Ví dụ:\n'
     + 'Tài khoản Premium|99000|VND|auto|Sử dụng 30 ngày\n'
     + 'Nhập /cancel để hủy.',
-  );
-});
-
-bot.action('admin_fill_stock_help', async (ctx) => {
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
-    await ctx.answerCbQuery(t(locale, 'noAdmin'), { show_alert: true });
-    return;
-  }
-
-  await ctx.answerCbQuery();
-  await ctx.reply(
-    'Fill tồn kho theo sản phẩm:\n'
-    + '1) Mở Admin -> Sản phẩm -> chọn 1 sản phẩm.\n'
-    + '2) Dùng "Thêm 1 TK" nếu nhập ít.\n'
-    + '3) Dùng "Thêm nhiều TK" nếu nhập nhiều dòng.\n'
-    + '4) Dùng "Xem kho AUTO" để đọc danh sách.\n'
-    + '5) Dùng "Sửa/Xóa TK" để CRUD từng tài khoản.\n'
-    + '6) Bot tự đồng bộ tồn kho sau mỗi thao tác.',
   );
 });
 
@@ -1307,7 +1229,7 @@ bot.command('notify', async (ctx) => {
   const message = messageParts.join(' ').trim();
 
   if (!targetIdRaw || !Number.isInteger(targetId) || !message) {
-    await ctx.reply(t(locale, 'notifyUsage'));
+    await ctx.reply('Dùng: /notify <telegram_id> <noi_dung>');
     return;
   }
 
@@ -1318,43 +1240,6 @@ bot.command('notify', async (ctx) => {
     await ctx.reply(`Gửi thất bại: ${error.message}`);
   }
 });
-
-bot.command('broadcast', async (ctx) => {
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
-    await ctx.reply(t(locale, 'noAdmin'));
-    return;
-  }
-
-  const message = getCommandPayload(ctx.message.text, 'broadcast');
-  if (!message) {
-    await ctx.reply(t(locale, 'broadcastUsage'));
-    return;
-  }
-
-  let ids = [];
-  try {
-    ids = await getAllUserTelegramIds();
-  } catch (error) {
-    await ctx.reply(`Không tải được danh sách người dùng: ${error.message}`);
-    return;
-  }
-
-  let success = 0;
-  let failed = 0;
-  for (const telegramId of ids) {
-    try {
-      await bot.telegram.sendMessage(telegramId, message);
-      success += 1;
-    } catch (error) {
-      failed += 1;
-    }
-  }
-
-  await ctx.reply(`Broadcast xong. Thành công: ${success}, thất bại: ${failed}.`);
-});
-
 
 bot.command('addproduct', async (ctx) => {
   const user = await ensureUser(ctx);
@@ -1382,28 +1267,6 @@ bot.command('addproduct', async (ctx) => {
     + `Tên: ${created.name}\n`
     + `Giá: ${created.price} ${created.currency}\n`
     + `Tồn: ${created.stock_quantity}`,
-  );
-});
-
-bot.action('admin_bulk_update_start', async (ctx) => {
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
-    await ctx.answerCbQuery(t(locale, 'noAdmin'), { show_alert: true });
-    return;
-  }
-
-  setPendingAdminInput(ctx, { type: 'bulk_update_products' });
-  await ctx.answerCbQuery();
-  await ctx.reply(
-    'Nhập danh sách cập nhật nhiều sản phẩm (mỗi dòng 1 sản phẩm):\n'
-    + 'product_id|gia|ton|active(0/1)\n'
-    + 'active là tùy chọn.\n\n'
-    + 'Ví dụ:\n'
-    + '1111-2222|99000|20|1\n'
-    + '3333-4444|49000|5|0\n'
-    + '5555-6666|150000|10\n\n'
-    + 'Nhập /cancel để hủy.',
   );
 });
 
@@ -1549,6 +1412,38 @@ bot.action('catalogue_close', async (ctx) => {
   }
 });
 
+bot.action(/^paydone:(.+)$/, async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  const orderId = ctx.match[1];
+  const order = await loadOrderByIdForUser(orderId, user.id);
+
+  if (!order) {
+    await ctx.answerCbQuery(locale === 'en' ? 'Order not found' : 'Không tìm thấy đơn', { show_alert: true });
+    return;
+  }
+
+  const transferContent = buildSepayTransferCode(order.id);
+  await ctx.answerCbQuery(locale === 'en' ? 'Sent to admin' : 'Đã báo admin');
+  await ctx.reply(
+    locale === 'en'
+      ? `Payment notice sent. Admin will verify your transfer.\nOrder: #${order.id}\nTransfer content: ${transferContent}`
+      : `Đã gửi báo thanh toán cho admin. Vui lòng chờ xác nhận.\nĐơn: #${order.id}\nNội dung CK: ${transferContent}`,
+  );
+
+  const adminIds = [...runtimeAdminIds].map((id) => Number(id)).filter(Number.isInteger);
+  for (const telegramId of adminIds) {
+    try {
+      await bot.telegram.sendMessage(
+        telegramId,
+        `Bao thanh toan SEPAY\nDon: #${order.id}\nUser: ${user.id}\nSo tien: ${order.total_amount} ${order.currency || 'VND'}\nNoi dung CK: ${transferContent}`,
+      );
+    } catch (error) {
+      // no-op
+    }
+  }
+});
+
 bot.action(/^lang:(vi|en)$/, async (ctx) => {
   const user = await ensureUser(ctx);
   const target = ctx.match[1];
@@ -1629,34 +1524,6 @@ bot.action(/^ordst:(.+):(draft|confirmed|paid|cancelled)$/, async (ctx) => {
 
   await ctx.answerCbQuery('Updated');
   await ctx.reply(t(locale, 'orderStatusUpdated', { id: updated.id, status: updated.status }));
-});
-
-bot.action('admin_products', async (ctx) => {
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
-    await ctx.answerCbQuery(t(locale, 'noAdmin'), { show_alert: true });
-    return;
-  }
-
-  await ctx.answerCbQuery();
-  const products = await loadAdminProducts();
-
-  if (products.length === 0) {
-    await ctx.reply('Ch\u01b0a c\u00f3 s\u1ea3n ph\u1ea9m.');
-    return;
-  }
-
-  for (const product of products) {
-    const nextActive = product.is_active ? '0' : '1';
-    const text = `${product.name} | ${product.price} ${product.currency || 'VND'} | tồn:${product.stock_quantity ?? '-'} | ${product.is_active ? 'đang bán' : 'tạm ẩn'}`;
-    await ctx.reply(
-      text,
-      Markup.inlineKeyboard([
-        [Markup.button.callback(product.is_active ? 'Tắt' : 'Bật', `prdtg:${product.id}:${nextActive}`)],
-      ]),
-    );
-  }
 });
 
 bot.action(/^prdtg:(.+):(0|1)$/, async (ctx) => {
@@ -1813,113 +1680,6 @@ bot.action(/^admaddacc:(.+)$/, async (ctx) => {
     + 'Ví dụ:\n'
     + 'email1@gmail.com|MatKhau123|2FA:ABCD-EFGH\n'
     + 'email2@gmail.com|MatKhau456\n\n'
-    + 'Nhập /cancel để hủy.',
-  );
-});
-
-bot.action(/^admviewacc:(.+)$/, async (ctx) => {
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
-    await ctx.answerCbQuery(t(locale, 'noAdmin'), { show_alert: true });
-    return;
-  }
-
-  const productId = ctx.match[1];
-  const product = await loadProductAny(productId);
-  if (!product) {
-    await ctx.answerCbQuery('Not found');
-    return;
-  }
-
-  const rows = await loadProductAccounts(productId, 20);
-  await ctx.answerCbQuery();
-  if (rows.length === 0) {
-    await ctx.reply(`Kho AUTO của "${product.name}" đang trống.`);
-    return;
-  }
-
-  const lines = rows.map((row, idx) => {
-    const status = row.is_used ? 'used' : 'unused';
-    return `${idx + 1}. [${status}] ${row.id} | ${row.account_data}`;
-  });
-  await ctx.reply(
-    `Kho AUTO của "${product.name}" (tối đa 20 dòng mới nhất):\n${lines.join('\n')}`,
-    Markup.inlineKeyboard([
-      [
-        Markup.button.callback('Sửa 1 TK', `admstockedit:${productId}`),
-        Markup.button.callback('Xóa 1 TK', `admstockdelete:${productId}`),
-      ],
-    ]),
-  );
-});
-
-bot.action(/^admstockcrud:(.+)$/, async (ctx) => {
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
-    await ctx.answerCbQuery(t(locale, 'noAdmin'), { show_alert: true });
-    return;
-  }
-  const productId = ctx.match[1];
-  await ctx.answerCbQuery();
-  await ctx.reply(
-    'Chọn thao tác kho AUTO:',
-    Markup.inlineKeyboard([
-      [
-        Markup.button.callback('Xem kho', `admviewacc:${productId}`),
-        Markup.button.callback('Sửa 1 TK', `admstockedit:${productId}`),
-      ],
-      [
-        Markup.button.callback('Xóa 1 TK', `admstockdelete:${productId}`),
-        Markup.button.callback('Thêm 1 TK', `admaddacc1:${productId}`),
-      ],
-    ]),
-  );
-});
-
-bot.action(/^admstockedit:(.+)$/, async (ctx) => {
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
-    await ctx.answerCbQuery(t(locale, 'noAdmin'), { show_alert: true });
-    return;
-  }
-  const productId = ctx.match[1];
-  const product = await loadProductAny(productId);
-  if (!product) {
-    await ctx.answerCbQuery('Not found');
-    return;
-  }
-  setPendingAdminInput(ctx, { type: 'edit_account_data', productId });
-  await ctx.answerCbQuery();
-  await ctx.reply(
-    `Sửa tài khoản AUTO của "${product.name}".\n`
-    + 'Nhập theo mẫu: account_id|du_lieu_moi\n'
-    + 'Ví dụ: 1111-2222-3333-4444|email@gmail.com|MatKhauMoi|2FA:XYZ\n'
-    + 'Chỉ sửa được tài khoản chưa dùng.\n'
-    + 'Nhập /cancel để hủy.',
-  );
-});
-
-bot.action(/^admstockdelete:(.+)$/, async (ctx) => {
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
-    await ctx.answerCbQuery(t(locale, 'noAdmin'), { show_alert: true });
-    return;
-  }
-  const productId = ctx.match[1];
-  const product = await loadProductAny(productId);
-  if (!product) {
-    await ctx.answerCbQuery('Not found');
-    return;
-  }
-  setPendingAdminInput(ctx, { type: 'delete_account', productId });
-  await ctx.answerCbQuery();
-  await ctx.reply(
-    `Xóa tài khoản AUTO của "${product.name}".\n`
-    + 'Nhập account_id cần xóa (chỉ xóa được tài khoản chưa dùng).\n'
     + 'Nhập /cancel để hủy.',
   );
 });
@@ -2102,37 +1862,6 @@ bot.on('text', async (ctx, next) => {
       return;
     }
 
-    if (pending.type === 'bulk_update_products') {
-      const parsed = parseBulkProductUpdates(text);
-      if (parsed.total === 0) {
-        await ctx.reply('Không có dòng hợp lệ. Hãy nhập theo mẫu product_id|gia|ton|active(0/1).');
-        return;
-      }
-
-      let success = 0;
-      let failed = 0;
-      for (const item of parsed.updates) {
-        try {
-          await updateAdminProduct(item.productId, item.patch);
-          success += 1;
-        } catch (error) {
-          failed += 1;
-        }
-      }
-
-      clearPendingAdminInput(ctx);
-      await ctx.reply(
-        `Cập nhật nhiều sản phẩm xong.\n`
-        + `Tổng dòng: ${parsed.total}\n`
-        + `Hợp lệ: ${parsed.updates.length}\n`
-        + `Thành công: ${success}\n`
-        + `Thất bại: ${failed}\n`
-        + `Sai cú pháp: ${parsed.invalidLines.length}`,
-      );
-      await sendAdminProductsPanel(ctx);
-      return;
-    }
-
     if (pending.type === 'add_accounts') {
       const product = await loadProductAny(pending.productId);
       if (!product) {
@@ -2153,65 +1882,6 @@ bot.on('text', async (ctx, next) => {
       return;
     }
 
-    if (pending.type === 'edit_account_data') {
-      const product = await loadProductAny(pending.productId);
-      if (!product) {
-        clearPendingAdminInput(ctx);
-        await ctx.reply('Không tìm thấy sản phẩm.');
-        return;
-      }
-
-      const parsed = parseAccountUpdatePayload(text);
-      if (!parsed) {
-        await ctx.reply('Sai cú pháp. Mẫu: account_id|du_lieu_moi');
-        return;
-      }
-
-      const updatedAcc = await updateProductAccountData(
-        pending.productId,
-        parsed.accountId,
-        parsed.accountData,
-      );
-
-      if (!updatedAcc) {
-        await ctx.reply('Không sửa được. Kiểm tra account_id hoặc tài khoản đã dùng.');
-        return;
-      }
-
-      const synced = await syncProductStockFromAutoAccounts(pending.productId);
-      clearPendingAdminInput(ctx);
-      await ctx.reply(
-        `Đã cập nhật tài khoản ${updatedAcc.id}.\n`
-        + `Tồn hiện tại: ${synced.stock_quantity}`,
-      );
-      return;
-    }
-
-    if (pending.type === 'delete_account') {
-      const product = await loadProductAny(pending.productId);
-      if (!product) {
-        clearPendingAdminInput(ctx);
-        await ctx.reply('Không tìm thấy sản phẩm.');
-        return;
-      }
-
-      const accountId = String(text || '').trim();
-      if (!accountId) {
-        await ctx.reply('Vui lòng nhập account_id.');
-        return;
-      }
-
-      const deleted = await deleteProductAccount(pending.productId, accountId);
-      if (!deleted) {
-        await ctx.reply('Không xóa được. Kiểm tra account_id hoặc tài khoản đã dùng.');
-        return;
-      }
-
-      const synced = await syncProductStockFromAutoAccounts(pending.productId);
-      clearPendingAdminInput(ctx);
-      await ctx.reply(`Đã xóa tài khoản ${accountId}.\nTồn hiện tại: ${synced.stock_quantity}`);
-      return;
-    }
   } catch (error) {
     clearPendingAdminInput(ctx);
     await safeReply(ctx, `Xử lý thất bại: ${error.message}`);

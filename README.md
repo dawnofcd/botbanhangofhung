@@ -15,6 +15,7 @@ Optional:
 - `SEPAY_WEBHOOK_SECRET`
 - `SEPAY_ACCOUNT_NO`
 - `SEPAY_BANK_CODE`
+- `SEPAY_ACCOUNT_NAME`
 
 ## Database setup
 1. Open your PostgreSQL SQL console/tool.
@@ -39,6 +40,7 @@ Optional:
    - `SEPAY_WEBHOOK_SECRET` (optional)
    - `SEPAY_ACCOUNT_NO` (optional)
    - `SEPAY_BANK_CODE` (optional)
+   - `SEPAY_ACCOUNT_NAME` (optional)
 4. Start command: `npm start` (already in `railway.json`).
 5. Redeploy and check logs for `Bot launched.`
 
@@ -46,6 +48,9 @@ Optional:
 - User: `/start`, Danh muc, Lich su, Ho tro, Ngon ngu, Dat ngay.
 - Admin: `/admin`, `/claimadmin`, Don moi, cap nhat trang thai don, bat/tat san pham, thong ke.
 - Admin utility: `/notify`, `/broadcast`.
+
+## Admin guide
+- See `docs/admin_guide.md`
 
 ## Notes
 - Keep only one running instance when using long polling.
