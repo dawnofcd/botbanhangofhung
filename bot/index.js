@@ -33,6 +33,44 @@ const db = createClient({
 const runtimeAdminIds = new Set(adminTelegramIds);
 const pendingAdminInputs = new Map();
 const pendingUserInputs = new Map();
+const orderPaymentMessageRefs = new Map();
+
+function saveOrderPaymentMessageRef(orderId, chatId, messageId) {
+  const oid = String(orderId || '').trim();
+  const cid = Number(chatId);
+  const mid = Number(messageId);
+  if (!oid || !Number.isInteger(cid) || !Number.isInteger(mid)) {
+    return;
+  }
+
+  const current = orderPaymentMessageRefs.get(oid) || [];
+  const exists = current.some((item) => item.chatId === cid && item.messageId === mid);
+  if (!exists) {
+    current.push({ chatId: cid, messageId: mid });
+    orderPaymentMessageRefs.set(oid, current);
+  }
+}
+
+async function clearOrderPaymentMessages(orderId) {
+  const oid = String(orderId || '').trim();
+  if (!oid) {
+    return;
+  }
+
+  const refs = orderPaymentMessageRefs.get(oid) || [];
+  if (!refs.length) {
+    return;
+  }
+
+  for (const ref of refs) {
+    try {
+      await bot.telegram.deleteMessage(ref.chatId, ref.messageId);
+    } catch (error) {
+      // ignore: message can be already deleted / too old / not found
+    }
+  }
+  orderPaymentMessageRefs.delete(oid);
+}
 
 const TEXTS = {
   vi: {
@@ -769,6 +807,7 @@ async function markOrderPaidFromMmobank(order, event) {
 
   await notifyOrderPaid(updated.id, updated.user_id, updated.total_amount, updated.currency || 'VND');
   await deliverAutoAccountsAfterPaid(updated);
+  await clearOrderPaymentMessages(updated.id);
   return { ok: true, alreadyPaid: false, order: updated };
 }
 
@@ -835,6 +874,7 @@ async function handleMmobankWebhook(req, res, rawBody) {
 
     const result = await markOrderPaidFromMmobank(order, event);
     if (result.alreadyPaid) {
+      await clearOrderPaymentMessages(order.id);
       alreadyPaidCount += 1;
       continue;
     }
@@ -1425,16 +1465,17 @@ async function processPurchase(ctx, user, locale, product, quantity = 1) {
   await ctx.reply(`${message}\nSố lượng: ${qty}\nĐơn giá: ${unitPrice} ${order.currency || 'VND'}`);
 
   const mmobank = buildMmobankInstruction(order);
+  let paymentMessage = null;
   if (mmobank.qrUrl) {
     try {
-      await ctx.replyWithPhoto(mmobank.qrUrl, {
+      paymentMessage = await ctx.replyWithPhoto(mmobank.qrUrl, {
         caption: mmobank.text,
         ...Markup.inlineKeyboard([
           [Markup.button.callback('Tôi đã chuyển khoản', `paydone:${order.id}`)],
         ]),
       });
     } catch (error) {
-      await ctx.reply(
+      paymentMessage = await ctx.reply(
         mmobank.text,
         Markup.inlineKeyboard([
           [Markup.button.callback('Tôi đã chuyển khoản', `paydone:${order.id}`)],
@@ -1442,12 +1483,16 @@ async function processPurchase(ctx, user, locale, product, quantity = 1) {
       );
     }
   } else {
-    await ctx.reply(
+    paymentMessage = await ctx.reply(
       mmobank.text,
       Markup.inlineKeyboard([
         [Markup.button.callback('Tôi đã chuyển khoản', `paydone:${order.id}`)],
       ]),
     );
+  }
+
+  if (paymentMessage?.chat?.id && Number.isInteger(paymentMessage.message_id)) {
+    saveOrderPaymentMessageRef(order.id, paymentMessage.chat.id, paymentMessage.message_id);
   }
 
   if (product.delivery_type === 'auto') {
@@ -1984,6 +2029,7 @@ bot.action(/^ordst:(.+):(draft|confirmed|paid|cancelled)$/, async (ctx) => {
 
   if (status === 'paid') {
     await deliverAutoAccountsAfterPaid(updated);
+    await clearOrderPaymentMessages(updated.id);
   }
 
   const { data: owner } = await db
