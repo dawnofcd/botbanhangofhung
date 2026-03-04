@@ -14,6 +14,7 @@ const mmobankBankCode = process.env.MMOBANK_BANK_CODE || process.env.SEPAY_BANK_
 const mmobankAccountName = process.env.MMOBANK_ACCOUNT_NAME || process.env.SEPAY_ACCOUNT_NAME || '';
 const mmobankWebhookPath = process.env.MMOBANK_WEBHOOK_PATH || process.env.SEPAY_WEBHOOK_PATH || '/mmobank/webhook';
 const webhookPort = Number(process.env.PORT || process.env.WEBHOOK_PORT || 3000);
+const supportZaloNumber = process.env.SUPPORT_ZALO || '0563228054';
 const adminTelegramIds = new Set(
   (process.env.ADMIN_TELEGRAM_IDS || '')
     .split(',')
@@ -508,7 +509,7 @@ async function createProduct(input) {
       slug,
       description: input.description || null,
       delivery_type: input.deliveryType || 'auto',
-      manual_contact_note: 'Sau khi chuy\u1ec3n kho\u1ea3n th\u00e0nh c\u00f4ng, vui l\u00f2ng nh\u1eafn admin \u0111\u1ec3 \u0111\u01b0\u1ee3c c\u1ea5p t\u00e0i kho\u1ea3n.',
+      manual_contact_note: `Sau khi chuyển khoản thành công, vui lòng liên hệ Zalo ${supportZaloNumber} để được cấp tài khoản.`,
       price: input.price,
       currency: input.currency || 'VND',
       stock_quantity: 0,
@@ -1995,14 +1996,17 @@ function buildMmobankInstruction(order) {
   return { text: lines.join('\n'), qrUrl, transferContent };
 }
 
-function buildOrderCreatedMessage(order, quantity, unitPrice) {
+function buildOrderCreatedMessage(order, product, quantity, unitPrice) {
   const transferContent = String(order?.id || '').trim().split('-')[0] || buildMmobankTransferCode(order?.id);
   const currency = order?.currency || 'VND';
   const total = Number(order?.total_amount || 0);
   const qty = Number(quantity || 0);
   const unit = Number(unitPrice || 0);
+  const isManual = product?.delivery_type === 'manual';
+  const manualNote = String(product?.manual_contact_note || '').trim()
+    || `Sản phẩm giao thủ công. Liên hệ Zalo ${supportZaloNumber} để nhận tài khoản.`;
 
-  return [
+  const lines = [
     '━━━━━━━━━━━━━━━━━━',
     '✅ ĐƠN HÀNG ĐÃ ĐƯỢC TẠO',
     '━━━━━━━━━━━━━━━━━━',
@@ -2017,12 +2021,21 @@ function buildOrderCreatedMessage(order, quantity, unitPrice) {
     '💳 Vui lòng chuyển khoản đúng nội dung:',
     transferContent.toLowerCase(),
     '',
-    '🤖 Sau khi hệ thống xác nhận thanh toán,',
-    'tài khoản sẽ được gửi tự động trong vài giây.',
-    '',
-    '━━━━━━━━━━━━━━━━━━',
-    'Cảm ơn bạn đã tin tưởng!',
-  ].join('\n');
+  ];
+
+  if (isManual) {
+    lines.push('📌 Sản phẩm giao thủ công.');
+    lines.push(`📱 Liên hệ Zalo: ${supportZaloNumber}`);
+    lines.push(manualNote);
+  } else {
+    lines.push('🤖 Sau khi hệ thống xác nhận thanh toán,');
+    lines.push('tài khoản sẽ được gửi tự động trong vài giây.');
+  }
+
+  lines.push('');
+  lines.push('━━━━━━━━━━━━━━━━━━');
+  lines.push('Cảm ơn bạn đã tin tưởng!');
+  return lines.join('\n');
 }
 
 function compactProductButtonLabel(product) {
@@ -2136,7 +2149,7 @@ async function processPurchase(ctx, user, locale, product, quantity = 1) {
 
   const order = await createSingleItemOrder(user.id, product, qty);
   const unitPrice = calcUnitPriceByQuantity(product.price, qty);
-  await ctx.reply(buildOrderCreatedMessage(order, qty, unitPrice));
+  await ctx.reply(buildOrderCreatedMessage(order, product, qty, unitPrice));
 
   const mmobank = buildMmobankInstruction(order);
   let paymentMessage = null;
@@ -2530,8 +2543,10 @@ bot.action('admin_add_product_start', async (ctx) => {
   await ctx.reply(
     'Nhập sản phẩm mới theo mẫu:\n'
     + 'ten|gia|currency|delivery(auto/manual)|mo_ta\n'
-    + 'Ví dụ:\n'
-    + 'Tài khoản Premium|99000|VND|auto|Sử dụng 30 ngày\n'
+    + 'Ví dụ AUTO:\n'
+    + 'Netflix Premium 1 tháng|99000|VND|auto|Giao tự động sau thanh toán\n\n'
+    + 'Ví dụ MANUAL:\n'
+    + 'Canva Pro nâng cấp|149000|VND|manual|Liên hệ Zalo 0563228054 để nhận tài khoản\n'
     + 'Nhập /cancel để hủy.',
   );
 });
@@ -2604,7 +2619,8 @@ bot.command('addproduct', async (ctx) => {
     await ctx.reply(
       'Sai cú pháp.\n'
       + 'Dùng: /addproduct <ten>|<gia>|<currency>|<delivery:auto|manual>|<mo_ta>\n'
-      + 'Ví dụ: /addproduct Tài khoản Premium|99000|VND|auto|Sử dụng 30 ngày',
+      + 'Ví dụ AUTO: /addproduct Netflix Premium 1 tháng|99000|VND|auto|Giao tự động sau thanh toán\n'
+      + 'Ví dụ MANUAL: /addproduct Canva Pro nâng cấp|149000|VND|manual|Liên hệ Zalo 0563228054 để nhận tài khoản',
     );
     return;
   }
@@ -3330,7 +3346,11 @@ bot.on('text', async (ctx, next) => {
     if (pending.type === 'add_product') {
       const parsed = parseAddProductPayload(text);
       if (!parsed.ok) {
-        await ctx.reply('Sai cú pháp. Mẫu: ten|gia|currency|delivery(auto/manual)|mo_ta');
+        await ctx.reply(
+          'Sai cú pháp. Mẫu: ten|gia|currency|delivery(auto/manual)|mo_ta\n'
+          + 'Ví dụ AUTO: Netflix Premium 1 tháng|99000|VND|auto|Giao tự động sau thanh toán\n'
+          + 'Ví dụ MANUAL: Canva Pro nâng cấp|149000|VND|manual|Liên hệ Zalo 0563228054 để nhận tài khoản',
+        );
         return;
       }
 
