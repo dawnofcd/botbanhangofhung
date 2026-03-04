@@ -7,7 +7,7 @@ const { createClient } = require('./pg_client');
 
 const botToken = process.env.TELEGRAM_TOKEN;
 const databaseUrl = process.env.DATABASE_URL;
-const adminSecretKey = process.env.ADMIN_SECRET_KEY || '';
+const adminSecretKey = String(process.env.ADMIN_SECRET_KEY || '').trim();
 const mmobankSecretKey = process.env.MMOBANK_SECRET_KEY || process.env.SEPAY_API_KEY || '';
 const mmobankAccountNo = process.env.MMOBANK_ACCOUNT_NO || process.env.SEPAY_ACCOUNT_NO || '';
 const mmobankBankCode = process.env.MMOBANK_BANK_CODE || process.env.SEPAY_BANK_CODE || '';
@@ -47,6 +47,12 @@ bot.use(async (ctx, next) => {
   const chatType = ctx.chat?.type;
   if (chatType === 'private') {
     return next();
+  }
+
+  const text = String(ctx.message?.text || '').trim();
+  if (text.startsWith('/')) {
+    await safeReply(ctx, 'Vui lòng dùng bot ở chat riêng (private).');
+    return;
   }
 
   if (ctx.callbackQuery) {
@@ -221,6 +227,7 @@ function parseAccountData(rawAccountData) {
 
 function buildPaidDeliveryMessage(order, sections, shortageCount) {
   const orderCode = String(order?.id || '').toUpperCase();
+  const supportCode = buildSupportOrderCode(order?.id);
   const productName = sections[0]?.productName || '(khong ro)';
 
   const lines = [
@@ -229,6 +236,7 @@ function buildPaidDeliveryMessage(order, sections, shortageCount) {
     '━━━━━━━━━━━━━━━━━━━━━━',
     '',
     `🔐 Mã đơn: #${orderCode}`,
+    `🧷 Mã hỗ trợ: ${supportCode || '(N/A)'}`,
     `📦 Sản phẩm: ${productName}`,
     '',
     '━━━━━━━━━━━━━━━━━━━━━━',
@@ -276,6 +284,8 @@ const TEXTS = {
     emptyHistory: 'Bạn chưa có đơn hàng nào.',
     supportEmpty: 'Chưa có kênh hỗ trợ.',
     noAdmin: 'Bạn không có quyền admin.',
+    invalidKey: 'Secret key không đúng.',
+    adminGranted: 'Đã cấp quyền admin.',
     adminPanel: 'Admin panel',
     langCurrent: 'Ngôn ngữ hiện tại: Tiếng Việt',
     orderCreated: 'Đã tạo đơn. Mã: #{id}\nTổng tiền: {total} {currency}',
@@ -291,6 +301,8 @@ const TEXTS = {
     emptyHistory: 'You do not have any orders yet.',
     supportEmpty: 'No support channels configured yet.',
     noAdmin: 'You are not an admin.',
+    invalidKey: 'Invalid secret key.',
+    adminGranted: 'Admin access granted.',
     adminPanel: 'Admin panel',
     langCurrent: 'Current language: English',
     orderCreated: 'Order created. ID: #{id}\nTotal: {total} {currency}',
@@ -492,12 +504,13 @@ function isAdmin(ctx, userRecord) {
 }
 
 function isSecretKeyValid(input) {
-  if (!adminSecretKey || !input) {
+  const normalizedInput = String(input || '').trim();
+  if (!adminSecretKey || !normalizedInput) {
     return false;
   }
 
   const expected = Buffer.from(adminSecretKey);
-  const actual = Buffer.from(input);
+  const actual = Buffer.from(normalizedInput);
   if (expected.length !== actual.length) {
     return false;
   }
@@ -1477,32 +1490,61 @@ async function loadAdminOrderDetail(orderId) {
 }
 
 async function findAdminOrderByKeyword(keyword) {
-  const normalized = String(keyword || '').trim().toLowerCase();
-  if (!normalized) {
+  const raw = String(keyword || '').trim();
+  if (!raw) {
     return null;
   }
+
+  const normalized = raw.replace(/^#/, '').trim();
+  const normalizedLower = normalized.toLowerCase();
+  const normalizedUpper = normalized.toUpperCase();
+  const tokenUpper = normalizedUpper.startsWith('DH')
+    ? normalizedUpper.slice(2)
+    : normalizedUpper;
 
   const { data, error } = await db
     .from('orders')
     .select('id,user_id,status,total_amount,currency,payment_method,created_at')
     .order('created_at', { ascending: false })
-    .limit(300);
+    .limit(5000);
   if (error) {
     throw error;
   }
 
   const rows = data || [];
-  const matched = rows.find((row) => String(row.id || '').toLowerCase().startsWith(normalized));
+  const matched = rows.find((row) => {
+    const orderId = String(row.id || '');
+    const orderIdLower = orderId.toLowerCase();
+    const shortCode = buildMmobankTransferCode(orderId).toUpperCase();
+    const supportCode = buildSupportOrderCode(orderId).toUpperCase();
+    const legacyCode = `DH${orderId.replace(/-/g, '').slice(0, 10).toUpperCase()}`;
+
+    if (orderIdLower === normalizedLower || orderIdLower.startsWith(normalizedLower)) {
+      return true;
+    }
+
+    if (normalizedUpper === shortCode || normalizedUpper === supportCode || normalizedUpper === legacyCode) {
+      return true;
+    }
+
+    if (tokenUpper && shortCode.startsWith(tokenUpper)) {
+      return true;
+    }
+
+    return false;
+  });
   return matched || null;
 }
 
 function buildAdminOrderInspectText(order) {
+  const supportCode = buildSupportOrderCode(order.id);
   const lines = [
     '━━━━━━━━━━━━━━━━━━━━━━',
     '🔎 CHECK ĐƠN HÀNG',
     '━━━━━━━━━━━━━━━━━━━━━━',
     '',
     `🆔 Mã đơn: #${order.id}`,
+    `🧷 Mã hỗ trợ: ${supportCode || 'N/A'}`,
     `👤 User ID: ${order.user_id}`,
     `📌 Trạng thái: ${order.status}`,
     `💳 Thanh toán: ${order.payment_method || 'N/A'}`,
@@ -1558,8 +1600,9 @@ function buildOrderHistoryPanel(orders, locale) {
     const status = normalizeStatus(order.status);
     const icon = statusIcon(status);
     const idText = String(order.id || '').slice(0, 8).toUpperCase();
+    const supportCode = buildSupportOrderCode(order.id);
     const currency = order.currency || 'VND';
-    lines.push(`${icon} #${idText}`);
+    lines.push(`${icon} ${supportCode || `DH${idText}`}`);
     lines.push(`\uD83D\uDCB0 ${formatPriceVnd(amount)} ${currency}`);
     lines.push('');
   }
@@ -1590,9 +1633,10 @@ function buildOrderHistoryKeyboard(orders, locale) {
   for (const order of orders) {
     const status = normalizeStatus(order.status);
     const idText = String(order.id || '').slice(0, 8).toUpperCase();
+    const supportCode = buildSupportOrderCode(order.id);
     rows.push([
       Markup.button.callback(
-        `${statusIcon(status)} #${idText} • ${formatPriceVnd(order.total_amount)} ${order.currency || 'VND'}`,
+        `${statusIcon(status)} ${supportCode || `DH${idText}`} • ${formatPriceVnd(order.total_amount)} ${order.currency || 'VND'}`,
         `myord:${order.id}`,
       ),
     ]);
@@ -1609,12 +1653,14 @@ function buildOrderHistoryKeyboard(orders, locale) {
 function buildUserOrderDetailText(detail, locale) {
   const status = String(detail?.status || '').toLowerCase();
   const isPaid = status === 'paid';
+  const supportCode = buildSupportOrderCode(detail?.id);
   const lines = [
     '━━━━━━━━━━━━━━━━━━━━━━',
     locale === 'en' ? '🧾 ORDER DETAIL' : '🧾 CHI TIẾT ĐƠN HÀNG',
     '━━━━━━━━━━━━━━━━━━━━━━',
     '',
     `🆔 #${detail.id}`,
+    `${locale === 'en' ? '🧷 Support code' : '🧷 Mã hỗ trợ'}: ${supportCode || 'N/A'}`,
     `📌 ${locale === 'en' ? 'Status' : 'Trạng thái'}: ${status || '-'}`,
     `💰 ${locale === 'en' ? 'Total' : 'Tổng tiền'}: ${formatPriceVnd(detail.total_amount)} ${detail.currency || 'VND'}`,
     `💳 ${locale === 'en' ? 'Payment' : 'Thanh toán'}: ${detail.payment_method || 'N/A'}`,
@@ -1750,7 +1796,7 @@ function buildSupportPanel(channels, locale) {
       `💬 Zalo Group: ${info.zaloGroup || 'N/A'}`,
       `📲 Telegram: ${info.telegram || 'N/A'}`,
       '',
-      'Need help? Contact us via any channel above.',
+      'Need help? Contact us via any channel above and send your support code (DHxxxxxx).',
     ].join('\n');
   }
 
@@ -1764,7 +1810,7 @@ function buildSupportPanel(channels, locale) {
     `💬 Box Zalo: ${info.zaloGroup || 'Chưa cập nhật'}`,
     `📲 Telegram: ${info.telegram || 'Chưa cập nhật'}`,
     '',
-    'Cần hỗ trợ? Liên hệ với chúng tôi qua bất kỳ kênh nào ở trên!',
+    'Cần hỗ trợ? Gửi cho admin mã hỗ trợ đơn (dạng DHxxxxxx) để kiểm tra nhanh.',
   ].join('\n');
 }
 
@@ -2212,6 +2258,14 @@ function buildMmobankTransferCode(orderId) {
   return compact.slice(0, 8).toUpperCase();
 }
 
+function buildSupportOrderCode(orderId) {
+  const short = buildMmobankTransferCode(orderId);
+  if (!short) {
+    return '';
+  }
+  return `DH${short}`;
+}
+
 function extractTransferCodeFromText(text) {
   const normalized = String(text || '').toUpperCase();
   const oldStyle = normalized.match(/DH[A-Z0-9]{4,20}/);
@@ -2419,6 +2473,7 @@ function buildMmobankInstruction(order) {
 
 function buildOrderCreatedMessage(order, product, quantity, unitPrice) {
   const transferContent = String(order?.id || '').trim().split('-')[0] || buildMmobankTransferCode(order?.id);
+  const supportCode = buildSupportOrderCode(order?.id);
   const currency = order?.currency || 'VND';
   const total = Number(order?.total_amount || 0);
   const qty = Number(quantity || 0);
@@ -2434,6 +2489,7 @@ function buildOrderCreatedMessage(order, product, quantity, unitPrice) {
     '',
     '🆔 Order ID:',
     `#${order.id}`,
+    `🧷 Mã hỗ trợ: ${supportCode || '(N/A)'}`,
     '',
     `📦 Số lượng: ${qty}`,
     `💵 Giá: ${formatPriceVnd(unit)} ${currency}`,
@@ -2891,7 +2947,7 @@ function buildHelpMessage(locale, admin = false) {
       '/orders - Xem đơn hàng',
       '/me - Thông tin tài khoản',
       '/admin - Mở dashboard admin',
-      '/checkorder <ma_don> - Kiểm tra chi tiết đơn',
+      '/checkorder <ma_don|ma_ho_tro_DHxxxxxx> - Kiểm tra chi tiết đơn',
       '/kho <ma_sp> - Xem kho tài khoản AUTO của sản phẩm',
       '/addproduct <ten>|<gia>|<currency>|<delivery>|<mo_ta> - Thêm sản phẩm nhanh',
       '/notify <telegram_id> <noi_dung> - Gửi tin nhắn thủ công',
@@ -3112,7 +3168,7 @@ bot.command('checkorder', async (ctx) => {
 
   const keyword = getCommandPayload(ctx.message.text, 'checkorder');
   if (!keyword) {
-    await ctx.reply('Dùng: /checkorder <ma_don_hoac_8_ky_tu_dau>');
+    await ctx.reply('Dùng: /checkorder <ma_don|ma_ho_tro_DHxxxxxx|8_ky_tu_dau>');
     return;
   }
 
@@ -3226,6 +3282,11 @@ bot.command('claimadmin', async (ctx) => {
   const secret = parts[1] || '';
   const user = await ensureUser(ctx);
   const locale = getLocale(user);
+
+  if (!secret) {
+    await ctx.reply('Dùng: /claimadmin <secret_key>');
+    return;
+  }
 
   if (!isSecretKeyValid(secret)) {
     await ctx.reply(t(locale, 'invalidKey'));
