@@ -113,9 +113,8 @@ where p.slug = 'netflix-premium-1-thang'
 -- 4) Support / payment channels
 insert into public.support_channels (name, type, value, is_active)
 values
-  ('Hotline', 'phone', '1900 000', true),
-  ('Telegram Support', 'telegram', 'https://t.me/your_support', true),
-  ('Thanh toan VietQR', 'url', 'https://img.vietqr.io/image/VCB-123456789-compact2.png', true)
+  ('Zalo', 'phone', '0563228054', true),
+  ('Zalo Group', 'url', 'https://zalo.me/g/cwkmie214', true)
 on conflict (type, value) do update
 set
   name = excluded.name,
