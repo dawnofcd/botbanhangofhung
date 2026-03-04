@@ -1443,21 +1443,30 @@ async function loadReport() {
 }
 
 async function loadAdminSnapshot() {
-  const [openOrdersResp, activeProductsResp, lowStockResp] = await Promise.all([
-    db.from('orders').select('id', { count: 'exact', head: true }).in('status', ['draft', 'confirmed']),
-    db.from('products').select('id', { count: 'exact', head: true }).eq('is_active', true),
-    db.from('products').select('id', { count: 'exact', head: true }).lte('stock_quantity', 3).eq('is_active', true),
-  ]);
+  try {
+    const [openOrdersResp, activeProductsResp, lowStockResp] = await Promise.all([
+      db.from('orders').select('id', { count: 'exact', head: true }).in('status', ['draft', 'confirmed']),
+      db.from('products').select('id', { count: 'exact', head: true }).eq('is_active', true),
+      db.from('products').select('id', { count: 'exact', head: true }).lte('stock_quantity', 3).eq('is_active', true),
+    ]);
 
-  if (openOrdersResp.error) throw openOrdersResp.error;
-  if (activeProductsResp.error) throw activeProductsResp.error;
-  if (lowStockResp.error) throw lowStockResp.error;
+    if (openOrdersResp.error) throw openOrdersResp.error;
+    if (activeProductsResp.error) throw activeProductsResp.error;
+    if (lowStockResp.error) throw lowStockResp.error;
 
-  return {
-    openOrders: openOrdersResp.count || 0,
-    activeProducts: activeProductsResp.count || 0,
-    lowStockProducts: lowStockResp.count || 0,
-  };
+    return {
+      openOrders: openOrdersResp.count || 0,
+      activeProducts: activeProductsResp.count || 0,
+      lowStockProducts: lowStockResp.count || 0,
+    };
+  } catch (error) {
+    console.error('loadAdminSnapshot failed:', error);
+    return {
+      openOrders: 0,
+      activeProducts: 0,
+      lowStockProducts: 0,
+    };
+  }
 }
 
 function buildAdminMainText(snapshot) {
@@ -1475,16 +1484,36 @@ function buildAdminMainText(snapshot) {
 }
 
 async function sendAdminMainPanel(ctx, shouldEdit = false) {
-  const snapshot = await loadAdminSnapshot();
-  const text = buildAdminMainText(snapshot);
-  const keyboard = buildAdminMainKeyboard();
+  try {
+    const snapshot = await loadAdminSnapshot();
+    const text = buildAdminMainText(snapshot);
+    const keyboard = buildAdminMainKeyboard();
 
-  if (shouldEdit) {
-    await replaceOrReply(ctx, text, keyboard);
-    return;
+    if (shouldEdit) {
+      await replaceOrReply(ctx, text, keyboard);
+      return;
+    }
+
+    await safeReply(ctx, text, keyboard);
+  } catch (error) {
+    console.error('sendAdminMainPanel failed:', error);
+    const fallbackText = [
+      '━━━━━━━━━━━━━━━━━━━━━━',
+      '🛠 ADMIN DASHBOARD',
+      '━━━━━━━━━━━━━━━━━━━━━━',
+      '',
+      'Không tải được thống kê nhanh.',
+      'Bạn vẫn có thể dùng các chức năng quản trị bên dưới.',
+    ].join('\n');
+    const keyboard = buildAdminMainKeyboard();
+
+    if (shouldEdit) {
+      await replaceOrReply(ctx, fallbackText, keyboard);
+      return;
+    }
+
+    await safeReply(ctx, fallbackText, keyboard);
   }
-
-  await safeReply(ctx, text, keyboard);
 }
 
 async function safeReply(ctx, text, extra) {
