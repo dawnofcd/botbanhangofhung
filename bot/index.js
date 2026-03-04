@@ -449,7 +449,7 @@ function parseBulkAccountLines(input) {
 async function loadActiveProducts(limit = 50) {
   const { data, error } = await db
     .from('products')
-    .select('id,name,price,currency,stock_quantity')
+    .select('id,name,price,currency,stock_quantity,delivery_type')
     .eq('is_active', true)
     .order('updated_at', { ascending: false })
     .limit(limit);
@@ -1234,6 +1234,41 @@ async function loadOrderByIdForUser(orderId, userId) {
   return data;
 }
 
+async function loadUserOrderDetail(orderId, userId) {
+  const { data: order, error: orderError } = await db
+    .from('orders')
+    .select('id,user_id,status,total_amount,currency,payment_method,created_at')
+    .eq('id', orderId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (orderError) {
+    throw orderError;
+  }
+  if (!order) {
+    return null;
+  }
+
+  const { data: items, error: itemsError } = await db
+    .from('order_items')
+    .select('product_id,quantity,unit_price,total_price,products(name,delivery_type)')
+    .eq('order_id', orderId)
+    .order('created_at', { ascending: true });
+  if (itemsError) {
+    throw itemsError;
+  }
+
+  const { data: accounts, error: accountsError } = await db
+    .from('product_accounts')
+    .select('product_id,account_data,created_at')
+    .eq('used_order_id', orderId)
+    .order('created_at', { ascending: true });
+  if (accountsError) {
+    throw accountsError;
+  }
+
+  return { ...order, items: items || [], accounts: accounts || [] };
+}
+
 async function loadAdminOrderDetail(orderId) {
   const { data: order, error: orderError } = await db
     .from('orders')
@@ -1352,6 +1387,131 @@ function buildOrderHistoryPanel(orders, locale) {
   lines.push(`${locale === 'en' ? '\uD83D\uDCB5 Total amount' : '\uD83D\uDCB5 Tổng tiền'}: ${formatPriceVnd(totalAmount)} VND`);
   lines.push('━━━━━━━━━━━━━━━━━━━━━━');
   return lines.join('\n');
+}
+
+function buildOrderHistoryKeyboard(orders, locale) {
+  const rows = [];
+  const normalizeStatus = (value) => String(value || '').toLowerCase();
+  const statusIcon = (status) => {
+    if (status === 'paid') {
+      return '🟢';
+    }
+    if (status === 'confirmed') {
+      return '🔵';
+    }
+    if (status === 'cancelled') {
+      return '🔴';
+    }
+    return '⚪';
+  };
+
+  for (const order of orders) {
+    const status = normalizeStatus(order.status);
+    const idText = String(order.id || '').slice(0, 8).toUpperCase();
+    rows.push([
+      Markup.button.callback(
+        `${statusIcon(status)} #${idText} • ${formatPriceVnd(order.total_amount)} ${order.currency || 'VND'}`,
+        `myord:${order.id}`,
+      ),
+    ]);
+  }
+
+  rows.push([
+    Markup.button.callback(locale === 'en' ? '🔄 Refresh' : '🔄 Làm mới', 'menu_history'),
+    Markup.button.callback(locale === 'en' ? '🗑 Close' : '🗑 Đóng', 'history_close'),
+  ]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
+function buildUserOrderDetailText(detail, locale) {
+  const status = String(detail?.status || '').toLowerCase();
+  const isPaid = status === 'paid';
+  const lines = [
+    '━━━━━━━━━━━━━━━━━━━━━━',
+    locale === 'en' ? '🧾 ORDER DETAIL' : '🧾 CHI TIẾT ĐƠN HÀNG',
+    '━━━━━━━━━━━━━━━━━━━━━━',
+    '',
+    `🆔 #${detail.id}`,
+    `📌 ${locale === 'en' ? 'Status' : 'Trạng thái'}: ${status || '-'}`,
+    `💰 ${locale === 'en' ? 'Total' : 'Tổng tiền'}: ${formatPriceVnd(detail.total_amount)} ${detail.currency || 'VND'}`,
+    `💳 ${locale === 'en' ? 'Payment' : 'Thanh toán'}: ${detail.payment_method || 'N/A'}`,
+    '',
+    locale === 'en' ? '📦 Items:' : '📦 Sản phẩm:',
+  ];
+
+  const itemList = Array.isArray(detail.items) ? detail.items : [];
+  if (!itemList.length) {
+    lines.push(locale === 'en' ? '- (no item)' : '- (không có sản phẩm)');
+  } else {
+    for (const item of itemList) {
+      lines.push(
+        `- ${item.products?.name || item.product_id} | SL:${item.quantity} | ${formatPriceVnd(item.total_price)} ${detail.currency || 'VND'}`,
+      );
+    }
+  }
+
+  if (!isPaid) {
+    lines.push('');
+    lines.push(locale === 'en'
+      ? '⏳ Payment not completed yet. Account details appear after paid.'
+      : '⏳ Đơn chưa thanh toán. TK/MK sẽ hiện sau khi đơn ở trạng thái đã thanh toán.');
+    return lines.join('\n');
+  }
+
+  const accountsByProduct = new Map();
+  for (const row of (detail.accounts || [])) {
+    if (!row?.product_id || !row?.account_data) {
+      continue;
+    }
+    const arr = accountsByProduct.get(row.product_id) || [];
+    arr.push(row.account_data);
+    accountsByProduct.set(row.product_id, arr);
+  }
+
+  lines.push('');
+  lines.push(locale === 'en' ? '🔐 Account details (TK | MK | 2FA):' : '🔐 Thông tin tài khoản (TK | MK | 2FA):');
+
+  let hasAnyAccount = false;
+  for (const item of itemList) {
+    const productName = item.products?.name || item.product_id;
+    const deliveryType = String(item.products?.delivery_type || '').toLowerCase();
+    lines.push('');
+    lines.push(`• ${productName}`);
+
+    if (deliveryType && deliveryType !== 'auto') {
+      lines.push(locale === 'en' ? '  - Manual delivery product. Contact admin/Zalo.' : '  - Sản phẩm giao thủ công. Liên hệ admin/Zalo.');
+      continue;
+    }
+
+    const productAccounts = accountsByProduct.get(item.product_id) || [];
+    if (!productAccounts.length) {
+      lines.push(locale === 'en' ? '  - No account assigned yet.' : '  - Chưa có tài khoản được cấp.');
+      continue;
+    }
+
+    hasAnyAccount = true;
+    productAccounts.forEach((accountData, index) => {
+      const parsed = parseAccountData(accountData);
+      lines.push(`  ${index + 1}) ${parsed.account} | ${parsed.password} | ${parsed.twofa}`);
+    });
+  }
+
+  if (!hasAnyAccount) {
+    lines.push('');
+    lines.push(locale === 'en'
+      ? '⚠️ No account credentials found for this order.'
+      : '⚠️ Chưa có dữ liệu TK/MK cho đơn này.');
+  }
+
+  return lines.join('\n');
+}
+
+function buildUserOrderDetailKeyboard(orderId, locale) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(locale === 'en' ? '🗑 Delete message' : '🗑 Xóa tin nhắn', `ordclr:${orderId}`)],
+    [Markup.button.callback(locale === 'en' ? '↩ Back to orders' : '↩ Quay lại đơn hàng', 'menu_history')],
+  ]);
 }
 
 function buildSupportPanel(channels, locale) {
@@ -1490,9 +1650,9 @@ function orderActionKeyboard(orderId, currentStatus) {
 async function loadAdminProducts() {
   const { data, error } = await db
     .from('products')
-    .select('id,name,price,currency,stock_quantity,is_active,updated_at')
+    .select('id,name,price,currency,stock_quantity,is_active,updated_at,delivery_type')
     .order('updated_at', { ascending: false })
-    .limit(12);
+    .limit(40);
 
   if (error) {
     throw error;
@@ -2053,13 +2213,79 @@ function buildOrderCreatedMessage(order, product, quantity, unitPrice) {
   return lines.join('\n');
 }
 
+const PRODUCT_CATEGORY_KEYS = ['all', 'code', 'account', 'support'];
+
+function normalizeProductCategoryKey(rawValue) {
+  const key = String(rawValue || 'all').toLowerCase();
+  return PRODUCT_CATEGORY_KEYS.includes(key) ? key : 'all';
+}
+
+function inferProductCategoryKey(product) {
+  const mergedText = `${String(product?.name || '')} ${String(product?.description || '')}`.toLowerCase();
+  const deliveryType = String(product?.delivery_type || '').toLowerCase();
+
+  if (
+    mergedText.includes('code')
+    || mergedText.includes('key')
+    || mergedText.includes('kích hoạt')
+    || mergedText.includes('kich hoat')
+    || mergedText.includes('license')
+    || mergedText.includes('credit')
+  ) {
+    return 'code';
+  }
+
+  if (
+    deliveryType === 'manual'
+    || mergedText.includes('support')
+    || mergedText.includes('gia hạn')
+    || mergedText.includes('gia han')
+    || mergedText.includes('nâng')
+    || mergedText.includes('nang cap')
+    || mergedText.includes('liên hệ')
+    || mergedText.includes('lien he')
+  ) {
+    return 'support';
+  }
+
+  return 'account';
+}
+
+function productCategoryMeta(categoryKey, locale) {
+  const key = normalizeProductCategoryKey(categoryKey);
+  const en = locale === 'en';
+  if (key === 'code') {
+    return { key, icon: '🔑', label: en ? 'Code' : 'Code' };
+  }
+  if (key === 'account') {
+    return { key, icon: '👤', label: en ? 'Account' : 'Account' };
+  }
+  if (key === 'support') {
+    return { key, icon: '💬', label: en ? 'Support' : 'Support' };
+  }
+  return { key: 'all', icon: '🧰', label: en ? 'All' : 'Tất cả' };
+}
+
+function filterProductsByCategory(products, categoryKey) {
+  const selected = normalizeProductCategoryKey(categoryKey);
+  if (selected === 'all') {
+    return products;
+  }
+  return products.filter((product) => inferProductCategoryKey(product) === selected);
+}
+
 function compactProductButtonLabel(product) {
-  const maxNameLength = 24;
+  const maxNameLength = 34;
   const rawName = String(product.name || '').trim();
   const shortName = rawName.length > maxNameLength ? `${rawName.slice(0, maxNameLength - 1)}...` : rawName;
   const priceText = `${formatPriceVnd(product.price)}${product.currency === 'VND' ? 'đ' : ` ${product.currency || 'VND'}`}`;
   const stockText = Number.isFinite(Number(product.stock_quantity)) ? Number(product.stock_quantity) : 0;
-  return `${shortName} • ${priceText} • kho:${stockText}`;
+  const categoryKey = inferProductCategoryKey(product);
+  const category = productCategoryMeta(categoryKey, 'vi');
+  if (categoryKey === 'support') {
+    return `${category.icon} ${shortName} • ${priceText} • Liên hệ`;
+  }
+  return `${category.icon} ${shortName} • ${priceText} • 📦 ${stockText}`;
 }
 
 function formatDong(value) {
@@ -2101,24 +2327,83 @@ function buildProductDetailPanel(locale, product) {
   ].join('\n');
 }
 
-function buildCataloguePrompt(locale) {
-  const point = '\uD83D\uDED2';
-  return locale === 'en'
-    ? `${point} Choose a product:`
-    : `${point} Chọn sản phẩm muốn mua:`;
+function buildCataloguePrompt(locale, categoryKey = 'all', shownCount = 0, totalCount = 0) {
+  const selectedMeta = productCategoryMeta(categoryKey, locale);
+  if (locale === 'en') {
+    return [
+      '🛍 Choose Category',
+      '',
+      '📦 Product type:',
+      '• 🔑 [Code]',
+      '↳ Activation key / credit',
+      '• 👤 [Account]',
+      '↳ Account + password + 2FA (optional)',
+      '• 💬 [Support]',
+      '↳ Contact support service',
+      '',
+      `🎯 Filter: ${selectedMeta.icon} ${selectedMeta.label} (${shownCount}/${totalCount})`,
+      '',
+      'Choose a category to view packages 👇',
+    ].join('\n');
+  }
+
+  return [
+    '🛍 Chọn danh mục',
+    '',
+    '📦 Loại hàng:',
+    '• 🔑 [Code]',
+    '↳ Mã kích hoạt',
+    '• 👤 [Account]',
+    '↳ Tài khoản + mật khẩu + 2FA (Tùy chọn)',
+    '• 💬 [Support]',
+    '↳ Hỗ trợ liên hệ',
+    '',
+    `🎯 Đang lọc: ${selectedMeta.icon} ${selectedMeta.label} (${shownCount}/${totalCount})`,
+    '',
+    'Chọn một danh mục để xem gói 👇',
+  ].join('\n');
 }
 
-function buildCatalogueKeyboard(products, locale) {
-  const refresh = '\uD83D\uDD04';
-  const trash = '\uD83D\uDDD1';
-  const rows = products.map((p) => [Markup.button.callback(compactProductButtonLabel(p), `prd:${p.id}`)]);
+function buildCatalogueKeyboard(products, locale, categoryKey = 'all') {
+  const selected = normalizeProductCategoryKey(categoryKey);
+  const refreshLabel = locale === 'en' ? '🔄 Refresh' : '🔄 Làm mới';
+  const closeLabel = locale === 'en' ? '🗑 Close' : '🗑 Đóng';
+  const rows = [];
+
+  const groupKeys = ['code', 'account', 'support'];
+  rows.push(groupKeys.map((key) => {
+    const meta = productCategoryMeta(key, locale);
+    const selectedMark = selected === key ? '✅ ' : '';
+    return Markup.button.callback(`${selectedMark}${meta.icon} ${meta.label}`, `cat:${key}`);
+  }));
+  {
+    const allMeta = productCategoryMeta('all', locale);
+    const selectedMark = selected === 'all' ? '✅ ' : '';
+    rows.push([Markup.button.callback(`${selectedMark}${allMeta.icon} ${allMeta.label}`, 'cat:all')]);
+  }
+
+  const filteredProducts = filterProductsByCategory(products, selected);
+  if (filteredProducts.length === 0) {
+    rows.push([Markup.button.callback(locale === 'en' ? 'No package in this category' : 'Không có gói trong danh mục', 'noop')]);
+  } else {
+    for (const product of filteredProducts) {
+      rows.push([Markup.button.callback(compactProductButtonLabel(product), `prd:${product.id}`)]);
+    }
+  }
+
   rows.push([
-    Markup.button.callback(`${refresh} Làm mới`, 'catalogue_refresh'),
-    Markup.button.callback(`${trash} Đóng`, 'catalogue_close'),
+    Markup.button.callback(refreshLabel, `catrf:${selected}`),
+    Markup.button.callback(closeLabel, 'catalogue_close'),
   ]);
   return Markup.inlineKeyboard(rows);
 }
-async function sendCataloguePanel(ctx, locale, shouldEdit = false) {
+
+async function sendCataloguePanel(ctx, locale, options = {}) {
+  const normalizedOptions = typeof options === 'boolean'
+    ? { shouldEdit: options, categoryKey: 'all' }
+    : (options || {});
+  const shouldEdit = Boolean(normalizedOptions.shouldEdit);
+  const categoryKey = normalizeProductCategoryKey(normalizedOptions.categoryKey || 'all');
   const products = await loadActiveProducts();
   if (products.length === 0) {
     if (shouldEdit) {
@@ -2134,8 +2419,9 @@ async function sendCataloguePanel(ctx, locale, shouldEdit = false) {
     return;
   }
 
-  const text = buildCataloguePrompt(locale);
-  const keyboard = buildCatalogueKeyboard(products, locale);
+  const filteredProducts = filterProductsByCategory(products, categoryKey);
+  const text = buildCataloguePrompt(locale, categoryKey, filteredProducts.length, products.length);
+  const keyboard = buildCatalogueKeyboard(products, locale, categoryKey);
 
   if (shouldEdit) {
     try {
@@ -2203,33 +2489,66 @@ async function processPurchase(ctx, user, locale, product, quantity = 1) {
   await notifyAdminsNewOrder(order.id, order.total_amount, order.currency || 'VND');
 }
 
-function adminProductsListText(products) {
-  const lines = products.map((p) => {
-    const status = p.is_active ? '🟢 bán' : '⚪ ẩn';
-    return `• ${String(p.name || '').slice(0, 30)} | ${formatPriceVnd(p.price)} ${p.currency || 'VND'} | kho:${p.stock_quantity ?? '-'} | ${status}`;
-  });
+function adminProductsListText(products, categoryKey = 'all', totalCount = 0) {
+  const selectedMeta = productCategoryMeta(categoryKey, 'vi');
+  const lines = [];
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━');
+  lines.push('🛍 QUẢN LÝ SẢN PHẨM');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━');
+  lines.push('');
+  lines.push(`📂 Danh mục: ${selectedMeta.icon} ${selectedMeta.label} (${products.length}/${totalCount})`);
+  lines.push('');
 
-  return [
-    '━━━━━━━━━━━━━━━━━━━━━━',
-    '🛍 QUẢN LÝ SẢN PHẨM',
-    '━━━━━━━━━━━━━━━━━━━━━━',
-    '',
-    ...lines,
-    '',
-    'Chọn sản phẩm để sửa nhanh.',
-  ].join('\n');
+  if (products.length === 0) {
+    lines.push('Không có sản phẩm trong danh mục đã chọn.');
+    lines.push('');
+    lines.push('Chọn danh mục khác hoặc thêm sản phẩm mới.');
+    return lines.join('\n');
+  }
+
+  for (const product of products) {
+    const status = product.is_active ? '🟢 bán' : '⚪ ẩn';
+    const category = productCategoryMeta(inferProductCategoryKey(product), 'vi');
+    lines.push(
+      `${category.icon} ${String(product.name || '').slice(0, 36)} | ${formatPriceVnd(product.price)} ${product.currency || 'VND'} | 📦 ${product.stock_quantity ?? '-'} | ${status}`,
+    );
+  }
+  lines.push('');
+  lines.push('Chọn sản phẩm để sửa nhanh.');
+  return lines.join('\n');
 }
 
-function buildAdminProductsKeyboard(products) {
-  const rows = products.map((p) => {
-    const icon = p.is_active ? 'ON' : 'OFF';
-    const label = `[${icon}] ${String(p.name || '').slice(0, 28)}`;
-    return [Markup.button.callback(label, `admprd:${p.id}`)];
-  });
+function buildAdminProductsKeyboard(products, categoryKey = 'all') {
+  const selected = normalizeProductCategoryKey(categoryKey);
+  const filteredProducts = filterProductsByCategory(products, selected);
+  const rows = [];
+
+  const groupKeys = ['code', 'account', 'support'];
+  rows.push(groupKeys.map((key) => {
+    const meta = productCategoryMeta(key, 'vi');
+    const selectedMark = selected === key ? '✅ ' : '';
+    return Markup.button.callback(`${selectedMark}${meta.icon} ${meta.label}`, `admcat:${key}`);
+  }));
+  {
+    const allMeta = productCategoryMeta('all', 'vi');
+    const selectedMark = selected === 'all' ? '✅ ' : '';
+    rows.push([Markup.button.callback(`${selectedMark}${allMeta.icon} ${allMeta.label}`, 'admcat:all')]);
+  }
+
+  if (filteredProducts.length === 0) {
+    rows.push([Markup.button.callback('Không có sản phẩm trong mục', 'noop')]);
+  } else {
+    for (const product of filteredProducts) {
+      const statusIcon = product.is_active ? '🟢' : '⚪';
+      const category = productCategoryMeta(inferProductCategoryKey(product), 'vi');
+      const label = `${statusIcon}${category.icon} ${String(product.name || '').slice(0, 28)}`;
+      rows.push([Markup.button.callback(label, `admprd:${product.id}`)]);
+    }
+  }
 
   rows.push([
     Markup.button.callback('➕ Thêm mới', 'admin_add_product_start'),
-    Markup.button.callback('🔄 Làm mới', 'admin_products_refresh'),
+    Markup.button.callback('🔄 Làm mới', `admcat:${selected}`),
   ]);
   rows.push([
     Markup.button.callback('🏠 Admin', 'menu_admin'),
@@ -2273,7 +2592,12 @@ function adminProductDetailKeyboard(product) {
   ]);
 }
 
-async function sendAdminProductsPanel(ctx, shouldEdit = false) {
+async function sendAdminProductsPanel(ctx, options = {}) {
+  const normalizedOptions = typeof options === 'boolean'
+    ? { shouldEdit: options, categoryKey: 'all' }
+    : (options || {});
+  const shouldEdit = Boolean(normalizedOptions.shouldEdit);
+  const categoryKey = normalizeProductCategoryKey(normalizedOptions.categoryKey || 'all');
   const products = await loadAdminProducts();
   if (products.length === 0) {
     if (shouldEdit) {
@@ -2288,8 +2612,9 @@ async function sendAdminProductsPanel(ctx, shouldEdit = false) {
     return;
   }
 
-  const text = adminProductsListText(products);
-  const keyboard = buildAdminProductsKeyboard(products);
+  const filteredProducts = filterProductsByCategory(products, categoryKey);
+  const text = adminProductsListText(filteredProducts, categoryKey, products.length);
+  const keyboard = buildAdminProductsKeyboard(products, categoryKey);
   if (shouldEdit) {
     try {
       await ctx.editMessageText(text, keyboard);
@@ -2315,6 +2640,9 @@ function buildHelpMessage(locale, admin = false) {
     return [
       '📘 ADMIN HELP',
       '',
+      '/menu - Xem danh sách gói',
+      '/orders - Xem đơn hàng',
+      '/me - Thông tin tài khoản',
       '/admin - Mở dashboard admin',
       '/checkorder <ma_don> - Kiểm tra chi tiết đơn',
       '/kho <ma_sp> - Xem kho tài khoản AUTO của sản phẩm',
@@ -2328,33 +2656,32 @@ function buildHelpMessage(locale, admin = false) {
     return [
       '📘 HELP',
       '',
-      '/start - Main menu',
-      '/catalogue - Browse products',
-      '/history - View your orders',
-      '/support - Contact support',
-      '/language - Change language',
+      '/start - Browse packages',
+      '/menu - Browse packages',
+      '/orders - View your orders',
+      '/me - Your account info',
+      '/help - Help',
     ].join('\n');
   }
 
   return [
     '📘 TRỢ GIÚP',
     '',
-    '/start - Mở menu chính',
-    '/catalogue - Xem sản phẩm',
-    '/history - Xem đơn hàng',
-    '/support - Liên hệ hỗ trợ',
-    '/language - Đổi ngôn ngữ',
+    '/start - Xem danh sách gói',
+    '/menu - Xem danh sách gói',
+    '/orders - Xem đơn hàng',
+    '/me - Thông tin tài khoản',
+    '/help - Trợ giúp',
   ].join('\n');
 }
 
 async function registerChatMenuCommands() {
   const userCommands = [
-    { command: 'start', description: 'Mo menu chinh' },
-    { command: 'help', description: 'Huong dan nhanh' },
-    { command: 'catalogue', description: 'Xem san pham' },
-    { command: 'history', description: 'Don hang cua toi' },
-    { command: 'support', description: 'Kenh ho tro' },
-    { command: 'language', description: 'Doi ngon ngu' },
+    { command: 'start', description: 'Xem danh sach goi' },
+    { command: 'menu', description: 'Xem danh sach goi' },
+    { command: 'orders', description: 'Xem don hang' },
+    { command: 'me', description: 'Thong tin tai khoan' },
+    { command: 'help', description: 'Tro giup' },
   ];
 
   const adminCommands = [
@@ -2364,6 +2691,13 @@ async function registerChatMenuCommands() {
     { command: 'kho', description: 'Xem kho tai khoan AUTO' },
     { command: 'addproduct', description: 'Them san pham nhanh' },
   ];
+
+  try {
+    await bot.telegram.setMyDescription('Mua gói dịch vụ số, thanh toán nhanh, giao hàng tự động.');
+    await bot.telegram.setMyShortDescription('Mua gói dịch vụ số, thanh toán nhanh, giao hàng tự động.');
+  } catch (error) {
+    // ignore description sync failures
+  }
 
   // Default command set for all private chats.
   await bot.telegram.setMyCommands(userCommands, { scope: { type: 'all_private_chats' } });
@@ -2423,6 +2757,12 @@ bot.command('catalogue', async (ctx) => {
   await sendCataloguePanel(ctx, locale);
 });
 
+bot.command('menu', async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  await sendCataloguePanel(ctx, locale);
+});
+
 bot.command('history', async (ctx) => {
   const user = await ensureUser(ctx);
   const locale = getLocale(user);
@@ -2432,7 +2772,38 @@ bot.command('history', async (ctx) => {
     return;
   }
 
-  await ctx.reply(buildOrderHistoryPanel(orders, locale));
+  await ctx.reply(buildOrderHistoryPanel(orders, locale), buildOrderHistoryKeyboard(orders, locale));
+});
+
+bot.command('orders', async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  const orders = await loadRecentUserOrders(user.id);
+  if (orders.length === 0) {
+    await ctx.reply(t(locale, 'emptyHistory'));
+    return;
+  }
+
+  await ctx.reply(buildOrderHistoryPanel(orders, locale), buildOrderHistoryKeyboard(orders, locale));
+});
+
+bot.command('me', async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  const lines = [
+    locale === 'en' ? '👤 ACCOUNT INFO' : '👤 THÔNG TIN TÀI KHOẢN',
+    '',
+    `ID: ${user.id}`,
+    `Telegram: ${ctx.from?.id || '-'}`,
+    `Username: @${ctx.from?.username || 'N/A'}`,
+    locale === 'en'
+      ? `Role: ${isAdmin(ctx, user) ? 'admin' : 'customer'}`
+      : `Vai trò: ${isAdmin(ctx, user) ? 'admin' : 'khách hàng'}`,
+    locale === 'en'
+      ? `Language: ${getLocale(user)}`
+      : `Ngôn ngữ: ${getLocale(user)}`,
+  ];
+  await ctx.reply(lines.join('\n'));
 });
 
 bot.command('support', async (ctx) => {
@@ -2671,11 +3042,31 @@ bot.command('addproduct', async (ctx) => {
   );
 });
 
+bot.action('noop', async (ctx) => {
+  await ctx.answerCbQuery();
+});
+
 bot.action('menu_catalogue', async (ctx) => {
   const user = await ensureUser(ctx);
   const locale = getLocale(user);
   await ctx.answerCbQuery();
-  await sendCataloguePanel(ctx, locale, true);
+  await sendCataloguePanel(ctx, locale, { shouldEdit: true, categoryKey: 'all' });
+});
+
+bot.action(/^cat:(all|code|account|support)$/, async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  const categoryKey = ctx.match[1];
+  await ctx.answerCbQuery();
+  await sendCataloguePanel(ctx, locale, { shouldEdit: true, categoryKey });
+});
+
+bot.action(/^catrf:(all|code|account|support)$/, async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  const categoryKey = ctx.match[1];
+  await ctx.answerCbQuery(locale === 'en' ? 'Updated' : 'Đã cập nhật');
+  await sendCataloguePanel(ctx, locale, { shouldEdit: true, categoryKey });
 });
 
 bot.action(/^prd:(.+)$/, async (ctx) => {
@@ -2768,7 +3159,35 @@ bot.action('menu_history', async (ctx) => {
   }
 
   const text = buildOrderHistoryPanel(orders, locale);
-  await ctx.reply(text);
+  await replaceOrReply(ctx, text, buildOrderHistoryKeyboard(orders, locale));
+});
+
+bot.action(/^myord:(.+)$/, async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  const orderId = String(ctx.match[1] || '').trim();
+  if (!orderId) {
+    await ctx.answerCbQuery(locale === 'en' ? 'Order not found' : 'Không tìm thấy đơn', { show_alert: true });
+    return;
+  }
+
+  const detail = await loadUserOrderDetail(orderId, user.id);
+  if (!detail) {
+    await ctx.answerCbQuery(locale === 'en' ? 'Order not found' : 'Không tìm thấy đơn', { show_alert: true });
+    return;
+  }
+
+  await ctx.answerCbQuery();
+  await replaceOrReply(ctx, buildUserOrderDetailText(detail, locale), buildUserOrderDetailKeyboard(orderId, locale));
+});
+
+bot.action('history_close', async (ctx) => {
+  await ctx.answerCbQuery();
+  try {
+    await ctx.deleteMessage();
+  } catch (error) {
+    // no-op
+  }
 });
 
 bot.action('menu_support', async (ctx) => {
@@ -2800,7 +3219,7 @@ bot.action('catalogue_refresh', async (ctx) => {
   const user = await ensureUser(ctx);
   const locale = getLocale(user);
   await ctx.answerCbQuery(locale === 'en' ? 'Updated' : '\u0110\u00e3 c\u1eadp nh\u1eadt');
-  await sendCataloguePanel(ctx, locale, true);
+  await sendCataloguePanel(ctx, locale, { shouldEdit: true, categoryKey: 'all' });
 });
 
 bot.action('catalogue_close', async (ctx) => {
@@ -3057,7 +3476,7 @@ bot.action('admin_products_v2', async (ctx) => {
 
   clearPendingAdminInput(ctx);
   await ctx.answerCbQuery();
-  await sendAdminProductsPanel(ctx, true);
+  await sendAdminProductsPanel(ctx, { shouldEdit: true, categoryKey: 'all' });
 });
 
 bot.action('admin_products_refresh', async (ctx) => {
@@ -3069,7 +3488,20 @@ bot.action('admin_products_refresh', async (ctx) => {
   }
 
   await ctx.answerCbQuery('Updated');
-  await sendAdminProductsPanel(ctx, true);
+  await sendAdminProductsPanel(ctx, { shouldEdit: true, categoryKey: 'all' });
+});
+
+bot.action(/^admcat:(all|code|account|support)$/, async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  if (!isAdmin(ctx, user)) {
+    await ctx.answerCbQuery(t(locale, 'noAdmin'), { show_alert: true });
+    return;
+  }
+
+  const categoryKey = ctx.match[1];
+  await ctx.answerCbQuery('OK');
+  await sendAdminProductsPanel(ctx, { shouldEdit: true, categoryKey });
 });
 
 bot.action('admin_products_close', async (ctx) => {
