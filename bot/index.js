@@ -2090,6 +2090,17 @@ async function hardDeleteProduct(productId) {
   }
 }
 
+async function countOrderItemsByProductId(productId) {
+  const { count, error } = await db
+    .from('order_items')
+    .select('id', { count: 'exact', head: true })
+    .eq('product_id', productId);
+  if (error) {
+    throw error;
+  }
+  return count || 0;
+}
+
 async function loadReport() {
   const [
     totalOrdersResp,
@@ -4166,13 +4177,46 @@ bot.action(/^admdelete:(.+)$/, async (ctx) => {
   }
 
   try {
+    const linkedOrderItems = await countOrderItemsByProductId(productId);
+    if (linkedOrderItems > 0) {
+      await updateAdminProduct(productId, { is_active: false });
+      await safeAnswerCbQuery(
+        ctx,
+        `Sản phẩm đã có ${linkedOrderItems} dòng đơn hàng, không thể xóa cứng. Đã chuyển tạm ẩn.`,
+        { show_alert: true },
+      );
+
+      const refreshedProduct = await loadProductAny(productId);
+      if (refreshedProduct) {
+        await replaceOrReply(
+          ctx,
+          `${adminProductDetailText(refreshedProduct)}\n\n⚠️ Sản phẩm có dữ liệu đơn hàng nên chỉ tạm ẩn, không thể xóa hẳn.`,
+          adminProductDetailKeyboard(refreshedProduct),
+        );
+      }
+      return;
+    }
+
     await hardDeleteProduct(productId);
-    await ctx.answerCbQuery('Deleted');
-    await ctx.reply(`Đã xóa sản phẩm: ${product.name}`);
+    await safeAnswerCbQuery(ctx, 'Đã xóa sản phẩm');
+    await sendAdminProductsPanel(ctx, { shouldEdit: true, categoryKey: 'all' });
+    await safeReply(ctx, `Đã xóa sản phẩm: ${product.name}`);
   } catch (error) {
-    await updateAdminProduct(productId, { is_active: false });
-    await ctx.answerCbQuery('Disabled');
-    await ctx.reply(`Sản phẩm có liên kết đơn hàng, đã chuyển tạm ẩn: ${product.name}`);
+    console.error('admdelete failed:', error);
+    try {
+      await updateAdminProduct(productId, { is_active: false });
+      await safeAnswerCbQuery(ctx, 'Không thể xóa cứng, đã chuyển tạm ẩn.', { show_alert: true });
+      const refreshedProduct = await loadProductAny(productId);
+      if (refreshedProduct) {
+        await replaceOrReply(
+          ctx,
+          `${adminProductDetailText(refreshedProduct)}\n\n⚠️ Đã chuyển tạm ẩn do có ràng buộc dữ liệu.`,
+          adminProductDetailKeyboard(refreshedProduct),
+        );
+      }
+    } catch (nestedError) {
+      await safeAnswerCbQuery(ctx, 'Xóa sản phẩm thất bại, thử lại sau.', { show_alert: true });
+    }
   }
 });
 
