@@ -31,6 +31,21 @@ const db = createClient({
   connectionString: databaseUrl,
   ssl: process.env.PGSSL === 'false' ? false : { rejectUnauthorized: false },
 });
+bot.use(async (ctx, next) => {
+  const chatType = ctx.chat?.type;
+  if (chatType === 'private') {
+    return next();
+  }
+
+  if (ctx.callbackQuery) {
+    try {
+      await ctx.answerCbQuery('Vui lòng dùng bot ở chat riêng (private).', { show_alert: true });
+    } catch (error) {
+      // no-op
+    }
+  }
+});
+
 const runtimeAdminIds = new Set(adminTelegramIds);
 const pendingAdminInputs = new Map();
 const pendingUserInputs = new Map();
