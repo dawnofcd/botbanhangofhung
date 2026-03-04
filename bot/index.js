@@ -2333,17 +2333,38 @@ function buildHelpMessage(locale, admin = false) {
 }
 
 async function registerChatMenuCommands() {
-  const commands = [
-    { command: 'start', description: 'Open main menu' },
-    { command: 'help', description: 'Show help' },
-    { command: 'catalogue', description: 'Browse products' },
-    { command: 'history', description: 'View my orders' },
-    { command: 'support', description: 'Contact support' },
-    { command: 'language', description: 'Change language' },
-    { command: 'admin', description: 'Open admin panel' },
+  const userCommands = [
+    { command: 'start', description: 'Mo menu chinh' },
+    { command: 'help', description: 'Huong dan nhanh' },
+    { command: 'catalogue', description: 'Xem san pham' },
+    { command: 'history', description: 'Don hang cua toi' },
+    { command: 'support', description: 'Kenh ho tro' },
+    { command: 'language', description: 'Doi ngon ngu' },
   ];
 
-  await bot.telegram.setMyCommands(commands);
+  const adminCommands = [
+    ...userCommands,
+    { command: 'admin', description: 'Bang dieu khien admin' },
+    { command: 'checkorder', description: 'Kiem tra chi tiet don' },
+    { command: 'kho', description: 'Xem kho tai khoan AUTO' },
+    { command: 'addproduct', description: 'Them san pham nhanh' },
+  ];
+
+  // Default command set for all private chats.
+  await bot.telegram.setMyCommands(userCommands, { scope: { type: 'all_private_chats' } });
+
+  // Override command set for known admin Telegram IDs.
+  for (const rawId of runtimeAdminIds) {
+    const chatId = Number(rawId);
+    if (!Number.isInteger(chatId)) {
+      continue;
+    }
+    try {
+      await bot.telegram.setMyCommands(adminCommands, { scope: { type: 'chat', chat_id: chatId } });
+    } catch (error) {
+      // ignore: admin chat may not have started bot yet
+    }
+  }
 }
 
 bot.use(async (ctx, next) => {
