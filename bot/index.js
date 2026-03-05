@@ -735,7 +735,7 @@ async function loadActiveProducts(limit = 50) {
     throw error;
   }
 
-  return data || [];
+  return attachBuyerToOrders(data || []);
 }
 
 async function loadProduct(productId) {
@@ -1841,7 +1841,8 @@ async function loadAdminOrderDetail(orderId) {
     };
   });
 
-  return { ...order, items: normalizedItems };
+  const enrichedOrder = await attachBuyerToOrder(order);
+  return { ...enrichedOrder, items: normalizedItems };
 }
 
 async function findAdminOrderByKeyword(keyword) {
@@ -1900,11 +1901,11 @@ function buildAdminOrderInspectText(order) {
     '',
     `🆔 Mã đơn: #${order.id}`,
     `🧷 Mã hỗ trợ: ${supportCode || 'N/A'}`,
-    `👤 User ID: ${order.user_id}`,
+    `👤 Người mua: ${formatBuyerLabel(order)}`,
     `📌 Trạng thái: ${order.status}`,
     `💳 Thanh toán: ${order.payment_method || 'N/A'}`,
     `💰 Tổng tiền: ${formatPriceVnd(order.total_amount)} ${order.currency || 'VND'}`,
-    `🕒 Tạo lúc: ${order.created_at || 'N/A'}`,
+    `🕒 Tạo lúc: ${formatDateTimeVietnam(order.created_at)}`,
     '',
     '📦 Sản phẩm trong đơn:',
   ];
@@ -2225,7 +2226,69 @@ async function loadAdminOrderById(orderId) {
     throw error;
   }
 
-  return data;
+  return attachBuyerToOrder(data);
+}
+
+async function loadUsersByIds(userIds) {
+  const ids = [...new Set((userIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+  if (!ids.length) {
+    return new Map();
+  }
+
+  const { data, error } = await db
+    .from('users')
+    .select('id,telegram_id,username,display_name')
+    .in('id', ids);
+  if (error) {
+    throw error;
+  }
+
+  return new Map((data || []).map((row) => [row.id, row]));
+}
+
+async function attachBuyerToOrder(order) {
+  if (!order) {
+    return order;
+  }
+  const usersById = await loadUsersByIds([order.user_id]);
+  return {
+    ...order,
+    buyer: usersById.get(String(order.user_id || '').trim()) || null,
+  };
+}
+
+async function attachBuyerToOrders(orders) {
+  const rows = Array.isArray(orders) ? orders : [];
+  if (!rows.length) {
+    return [];
+  }
+  const usersById = await loadUsersByIds(rows.map((row) => row.user_id));
+  return rows.map((row) => ({
+    ...row,
+    buyer: usersById.get(String(row.user_id || '').trim()) || null,
+  }));
+}
+
+function formatBuyerLabel(order) {
+  const buyer = order?.buyer || null;
+  const displayName = String(buyer?.display_name || '').trim();
+  const username = String(buyer?.username || '').trim();
+  const telegramId = buyer?.telegram_id == null ? '' : String(buyer.telegram_id).trim();
+
+  const parts = [];
+  if (displayName) {
+    parts.push(displayName);
+  }
+  if (username) {
+    parts.push(`@${username}`);
+  }
+  if (telegramId) {
+    parts.push(`tele:${telegramId}`);
+  }
+  if (!parts.length) {
+    return 'tele:(khong ro)';
+  }
+  return parts.join(' | ');
 }
 
 function buildAdminOrdersText(orders) {
@@ -2242,7 +2305,7 @@ function buildAdminOrdersText(orders) {
 
   for (const order of orders) {
     lines.push(
-      `#${order.id.slice(0, 8)} | user:${order.user_id} | ${formatPriceVnd(order.total_amount)} ${order.currency || 'VND'} | ${order.status}`,
+      `#${order.id.slice(0, 8)} | ${formatBuyerLabel(order)} | ${formatPriceVnd(order.total_amount)} ${order.currency || 'VND'} | ${order.status}`,
     );
   }
 
@@ -2275,7 +2338,7 @@ function adminOrderDetailText(order) {
     '━━━━━━━━━━━━━━━━━━━━━━',
     '',
     `🆔 Mã đơn: #${order.id}`,
-    `👤 User ID: ${order.user_id}`,
+    `👤 Người mua: ${formatBuyerLabel(order)}`,
     `📌 Trạng thái: ${order.status}`,
     `💰 Tổng tiền: ${formatPriceVnd(order.total_amount)} ${order.currency || 'VND'}`,
   ].join('\n');
@@ -2632,6 +2695,32 @@ function parseNonNegativeInt(input) {
 function formatPriceVnd(value) {
   const n = Number(value || 0);
   return n.toLocaleString('vi-VN');
+}
+
+function formatDateTimeVietnam(value) {
+  if (!value) {
+    return 'N/A';
+  }
+
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return String(value);
+  }
+
+  try {
+    return new Intl.DateTimeFormat('vi-VN', {
+      timeZone: 'Asia/Ho_Chi_Minh',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).format(date);
+  } catch (error) {
+    return date.toISOString();
+  }
 }
 
 function buildMmobankTransferCode(orderId) {
