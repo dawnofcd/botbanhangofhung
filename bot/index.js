@@ -1510,21 +1510,31 @@ function renderAdminDashboardLoginPage(errorText = '') {
     '  <meta charset="utf-8" />',
     '  <meta name="viewport" content="width=device-width, initial-scale=1" />',
     '  <title>Admin Dashboard Login</title>',
+    '  <link rel="preconnect" href="https://fonts.googleapis.com" />',
+    '  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />',
+    '  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />',
     '  <style>',
-    '    body { font-family: "Segoe UI", Arial, sans-serif; background: #f4f6fb; margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }',
-    '    .card { width: min(420px, 92vw); background: #fff; border-radius: 16px; padding: 28px; box-shadow: 0 14px 40px rgba(16, 24, 40, 0.14); }',
-    '    h1 { margin: 0 0 8px; font-size: 24px; }',
-    '    p { margin: 0 0 18px; color: #5f6b7a; }',
-    '    input { width: 100%; padding: 12px; font-size: 15px; border-radius: 10px; border: 1px solid #d5dbe7; margin-bottom: 12px; box-sizing: border-box; }',
-    '    button { width: 100%; border: none; border-radius: 10px; background: #1f7aec; color: #fff; font-weight: 600; padding: 12px; cursor: pointer; }',
-    '    .alert { border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; font-size: 14px; }',
-    '    .alert-error { background: #fee4e2; color: #b42318; }',
-    '  </style>',
+    '    :root { --bg: #f3f7ff; --ink: #12263a; --muted: #5f7389; --line: #d4deea; --panel: #ffffff; --brand: #0f8a7f; --danger-bg: #ffe3e0; --danger-ink: #b42318; }',
+    '    * { box-sizing: border-box; }',
+    '    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; font-family: "IBM Plex Sans", sans-serif; color: var(--ink); background: radial-gradient(90rem 40rem at -15% -15%, #c5e6ff 0%, transparent 55%), radial-gradient(80rem 35rem at 115% -20%, #d8fff3 0%, transparent 52%), var(--bg); }',
+    '    .card { width: min(460px, 100%); border: 1px solid var(--line); border-radius: 22px; padding: 28px; background: linear-gradient(180deg, #ffffff 0%, #fbfdff 100%); box-shadow: 0 20px 45px rgba(17, 33, 51, 0.12); }',
+    '    .eyebrow { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 999px; background: #eaf8f6; color: #0b6f67; font-size: 12px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; margin-bottom: 12px; }',
+    '    h1 { margin: 0 0 8px; font-family: "Space Grotesk", sans-serif; font-size: 32px; line-height: 1.1; }',
+    '    p { margin: 0 0 18px; color: var(--muted); font-size: 15px; }',
+    '    input { width: 100%; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; font-size: 15px; color: var(--ink); margin-bottom: 12px; background: #fff; }',
+    '    input:focus { outline: 2px solid #9dd7d2; outline-offset: 1px; border-color: #87cfc9; }',
+    '    button { width: 100%; border: none; border-radius: 12px; background: var(--brand); color: #fff; font-weight: 600; padding: 12px; font-size: 15px; cursor: pointer; transition: transform .08s ease, filter .15s ease; }',
+    '    button:hover { filter: brightness(0.95); }',
+    '    button:active { transform: translateY(1px); }',
+    '    .alert { border-radius: 12px; padding: 10px 12px; margin-bottom: 12px; font-size: 14px; }',
+    '    .alert-error { background: var(--danger-bg); color: var(--danger-ink); border: 1px solid #f8c8c2; }',
+  '  </style>',
     '</head>',
     '<body>',
     '  <main class="card">',
+    '    <div class="eyebrow">Secure Access</div>',
     '    <h1>Admin Dashboard</h1>',
-    '    <p>Nhập key để truy cập trang quản trị.</p>',
+    '    <p>Nhập khóa quản trị để truy cập khu vực điều hành.</p>',
     `    ${errorBlock}`,
     `    <form method="post" action="${escapeHtml(`${adminDashboardPath}/login`)}">`,
     '      <input name="key" type="password" placeholder="ADMIN_DASHBOARD_KEY" autocomplete="off" required />',
@@ -1550,47 +1560,114 @@ function renderAdminDashboardPage({
   const safeTab = normalizeDashboardTab(tab);
   const safeStatusFilter = normalizeDashboardOrderStatus(statusFilter);
   const orderStatusOptions = ['all', 'draft', 'confirmed', 'paid', 'cancelled'];
+  const statusMeta = {
+    all: { label: 'Tất cả', className: 'neutral' },
+    draft: { label: 'Nháp', className: 'draft' },
+    confirmed: { label: 'Chờ thanh toán', className: 'confirmed' },
+    paid: { label: 'Đã thanh toán', className: 'paid' },
+    cancelled: { label: 'Đã hủy', className: 'cancelled' },
+  };
+  const orderActionMeta = {
+    confirmed: { label: 'Xác nhận', className: 'btn-confirm' },
+    paid: { label: 'Đã thanh toán', className: 'btn-paid' },
+    cancelled: { label: 'Hủy', className: 'btn-cancel' },
+  };
+
   const infoBlock = infoMessage ? `<div class="alert alert-info">${escapeHtml(infoMessage)}</div>` : '';
   const errorBlock = errorMessage ? `<div class="alert alert-error">${escapeHtml(errorMessage)}</div>` : '';
 
   const navOrdersClass = safeTab === 'orders' ? 'tab active' : 'tab';
   const navProductsClass = safeTab === 'products' ? 'tab active' : 'tab';
   const navAccountsClass = safeTab === 'accounts' ? 'tab active' : 'tab';
+  const accountProducts = products.filter((product) => usesAccountInventory(product));
+  const effectiveSelectedProductId = String(
+    selectedProductId
+    || selectedProduct?.id
+    || accountProducts[0]?.id
+    || '',
+  ).trim();
 
   const nav = [
     `<a class="${navOrdersClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'orders', status_filter: safeStatusFilter }))}">Đơn hàng</a>`,
     `<a class="${navProductsClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'products' }))}">Sản phẩm</a>`,
-    `<a class="${navAccountsClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'accounts', product_id: selectedProductId }))}">Kho account</a>`,
+    `<a class="${navAccountsClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'accounts', product_id: effectiveSelectedProductId }))}">Kho account</a>`,
   ].join('');
+
+  const orderStats = {
+    total: orders.length,
+    draft: 0,
+    confirmed: 0,
+    paid: 0,
+    cancelled: 0,
+  };
+  for (const order of orders) {
+    const currentStatus = String(order.status || '').toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(orderStats, currentStatus)) {
+      orderStats[currentStatus] += 1;
+    }
+  }
+  const activeProducts = products.filter((product) => Boolean(product.is_active)).length;
+  const lowStockProducts = products.filter((product) => Number(product.stock_quantity || 0) <= 3).length;
+  const statCards = [
+    { title: 'Đơn hiển thị', value: orderStats.total, tone: 'blue' },
+    { title: 'Đơn chờ thanh toán', value: orderStats.draft + orderStats.confirmed, tone: 'amber' },
+    { title: 'Đơn đã thanh toán', value: orderStats.paid, tone: 'green' },
+    { title: 'SP đang bật', value: activeProducts, tone: 'teal' },
+    { title: 'SP sắp hết', value: lowStockProducts, tone: 'red' },
+  ];
+  if (selectedProduct && accountSummary) {
+    statCards.push(
+      { title: 'Account available', value: Number(accountSummary.available || 0), tone: 'purple' },
+      { title: 'Account used', value: Number(accountSummary.used || 0), tone: 'gray' },
+    );
+  }
+  const statCardsHtml = statCards.map((card) => [
+    `<article class="stat-card tone-${escapeHtml(card.tone)}">`,
+    `  <h3>${escapeHtml(card.title)}</h3>`,
+    `  <p>${escapeHtml(String(card.value))}</p>`,
+    '</article>',
+  ].join('\n')).join('\n');
 
   const statusFilterOptions = orderStatusOptions.map((status) => {
     const selectedAttr = safeStatusFilter === status ? 'selected' : '';
-    return `<option value="${status}" ${selectedAttr}>${status.toUpperCase()}</option>`;
+    const label = statusMeta[status]?.label || status.toUpperCase();
+    return `<option value="${status}" ${selectedAttr}>${escapeHtml(label)}</option>`;
+  }).join('');
+
+  const quickFilterLinks = orderStatusOptions.map((status) => {
+    const active = safeStatusFilter === status ? 'chip active' : 'chip';
+    return `<a class="${active}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'orders', status_filter: status }))}">${escapeHtml(statusMeta[status]?.label || status)}</a>`;
   }).join('');
 
   const orderRows = orders.map((order) => {
     const buyer = formatBuyerLabel(order);
+    const currentStatus = String(order.status || '').toLowerCase();
+    const status = statusMeta[currentStatus] || { label: currentStatus || 'N/A', className: 'neutral' };
     const itemPreview = order.item_preview
       ? `${order.item_preview.firstProductName || '(N/A)'} x${order.item_preview.totalQuantity || 0}`
       : '(chưa có dòng sản phẩm)';
-    const actionStatuses = ['confirmed', 'paid', 'cancelled'].filter((status) => status !== String(order.status || '').toLowerCase());
+    const actionStatuses = ['confirmed', 'paid', 'cancelled'].filter((statusKey) => statusKey !== currentStatus);
     const actionForms = actionStatuses.map((actionStatus) => {
+      const meta = orderActionMeta[actionStatus] || { label: actionStatus, className: 'btn-neutral' };
       return [
         `<form method="post" action="${escapeHtml(`${adminDashboardPath}/order-status`)}">`,
         `  <input type="hidden" name="order_id" value="${escapeHtml(order.id)}" />`,
         `  <input type="hidden" name="status" value="${escapeHtml(actionStatus)}" />`,
         `  <input type="hidden" name="status_filter" value="${escapeHtml(safeStatusFilter)}" />`,
-        '  <button class="btn-small" type="submit">', `    ${escapeHtml(actionStatus)}`, '  </button>',
+        `  <button class="btn-small btn-action ${escapeHtml(meta.className)}" type="submit">${escapeHtml(meta.label)}</button>`,
         '</form>',
       ].join('\n');
     }).join('\n');
 
+    const shortId = String(order.id || '').slice(0, 8);
     return [
       '<tr>',
-      `  <td><code>${escapeHtml(order.id)}</code></td>`,
+      '  <td>',
+      `    <div class="id-stack"><strong>#${escapeHtml(shortId)}</strong><code>${escapeHtml(order.id)}</code></div>`,
+      '  </td>',
       `  <td>${escapeHtml(buyer)}</td>`,
       `  <td>${escapeHtml(itemPreview)}</td>`,
-      `  <td>${escapeHtml(String(order.status || '').toLowerCase())}</td>`,
+      `  <td><span class="status-badge ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span></td>`,
       `  <td>${escapeHtml(formatPriceVnd(order.total_amount))} ${escapeHtml(order.currency || 'VND')}</td>`,
       `  <td>${escapeHtml(formatDashboardDateTime(order.created_at))}</td>`,
       `  <td class="actions">${actionForms || '-'}</td>`,
@@ -1601,16 +1678,20 @@ function renderAdminDashboardPage({
   const orderPanel = [
     '<section class="panel">',
     '  <div class="panel-head">',
-    '    <h2>Đơn hàng</h2>',
+    '    <div>',
+    '      <h2>Đơn hàng</h2>',
+    `      <p class="panel-subtitle">Theo dõi trạng thái thanh toán và xử lý nhanh theo từng đơn.</p>`,
+    '    </div>',
     `    <form method="get" action="${escapeHtml(adminDashboardPath)}" class="inline-form">`,
     '      <input type="hidden" name="tab" value="orders" />',
     `      <label>Lọc trạng thái <select name="status_filter">${statusFilterOptions}</select></label>`,
     '      <button type="submit">Lọc</button>',
     '    </form>',
     '  </div>',
+    `  <div class="chips">${quickFilterLinks}</div>`,
     '  <div class="table-wrap">',
     '    <table>',
-    '      <thead><tr><th>ID</th><th>Người mua</th><th>Sản phẩm</th><th>Trạng thái</th><th>Tổng</th><th>Tạo lúc</th><th>Hành động</th></tr></thead>',
+      '      <thead><tr><th>ID</th><th>Người mua</th><th>Sản phẩm</th><th>Trạng thái</th><th>Tổng</th><th>Tạo lúc</th><th>Hành động</th></tr></thead>',
     `      <tbody>${orderRows || '<tr><td colspan="7">Không có dữ liệu.</td></tr>'}</tbody>`,
     '    </table>',
     '  </div>',
@@ -1621,11 +1702,13 @@ function renderAdminDashboardPage({
     const category = inferProductCategoryKey(product);
     const usingAccounts = usesAccountInventory(product);
     const checkedAttr = product.is_active ? 'checked' : '';
+    const stockValue = Number(product.stock_quantity || 0);
+    const stockBadgeClass = stockValue <= 3 ? 'stock-badge low' : 'stock-badge';
     const syncForm = usingAccounts
       ? [
         `<form method="post" action="${escapeHtml(`${adminDashboardPath}/product-sync`)}">`,
         `  <input type="hidden" name="product_id" value="${escapeHtml(product.id)}" />`,
-        '  <button class="btn-small" type="submit">Sync kho</button>',
+        '  <button class="btn-small btn-action btn-neutral" type="submit">Sync kho</button>',
         '</form>',
       ].join('\n')
       : '';
@@ -1635,17 +1718,18 @@ function renderAdminDashboardPage({
 
     return [
       '<tr>',
-      `  <td><code>${escapeHtml(product.id)}</code></td>`,
+      `  <td><div class="id-stack"><strong>${escapeHtml(String(product.id || '').slice(0, 8))}</strong><code>${escapeHtml(product.id)}</code></div></td>`,
       `  <td>${escapeHtml(product.name || '')}</td>`,
-      `  <td>${escapeHtml(category)}</td>`,
-      `  <td>${escapeHtml(product.delivery_type || '')}</td>`,
+      `  <td><span class="tag">${escapeHtml(category)}</span></td>`,
+      `  <td><span class="tag">${escapeHtml(product.delivery_type || '')}</span></td>`,
       '  <td>',
-      `    <form class="inline-form" method="post" action="${escapeHtml(`${adminDashboardPath}/product-update`)}">`,
+      `    <form class="inline-form product-form" method="post" action="${escapeHtml(`${adminDashboardPath}/product-update`)}">`,
       `      <input type="hidden" name="product_id" value="${escapeHtml(product.id)}" />`,
-      `      <input type="number" name="price" min="0" step="1" value="${escapeHtml(Math.round(Number(product.price || 0)))}" />`,
-      `      <input type="number" name="stock_quantity" min="0" step="1" value="${escapeHtml(Number(product.stock_quantity || 0))}" />`,
+      `      <label>Giá <input type="number" name="price" min="0" step="1" value="${escapeHtml(Math.round(Number(product.price || 0)))}" /></label>`,
+      `      <label>Tồn <input type="number" name="stock_quantity" min="0" step="1" value="${escapeHtml(stockValue)}" /></label>`,
+      `      <span class="${stockBadgeClass}">${escapeHtml(`Stock ${stockValue}`)}</span>`,
       `      <label class="checkbox"><input type="checkbox" name="is_active" value="1" ${checkedAttr} />Active</label>`,
-      '      <button type="submit">Lưu</button>',
+      '      <button class="btn-small btn-action btn-neutral" type="submit">Lưu</button>',
       '    </form>',
       '  </td>',
       `  <td>${escapeHtml(formatDashboardDateTime(product.updated_at))}</td>`,
@@ -1656,26 +1740,33 @@ function renderAdminDashboardPage({
 
   const productPanel = [
     '<section class="panel">',
-    '  <div class="panel-head"><h2>Sản phẩm</h2></div>',
+    '  <div class="panel-head">',
+    '    <div>',
+    '      <h2>Sản phẩm</h2>',
+    '      <p class="panel-subtitle">Sửa nhanh giá, tồn kho, trạng thái bán và đồng bộ kho key/account.</p>',
+    '    </div>',
+    '  </div>',
     '  <div class="table-wrap">',
     '    <table>',
-    '      <thead><tr><th>ID</th><th>Tên</th><th>Loại</th><th>Delivery</th><th>Giá / Tồn / Active</th><th>Cập nhật</th><th>Kho account</th></tr></thead>',
+      '      <thead><tr><th>ID</th><th>Tên</th><th>Loại</th><th>Delivery</th><th>Giá / Tồn / Active</th><th>Cập nhật</th><th>Kho account</th></tr></thead>',
     `      <tbody>${productRows || '<tr><td colspan="7">Không có dữ liệu.</td></tr>'}</tbody>`,
     '    </table>',
     '  </div>',
     '</section>',
   ].join('\n');
 
-  const accountProducts = products.filter((product) => usesAccountInventory(product));
   const accountOptions = accountProducts.map((product) => {
-    const selected = String(product.id) === String(selectedProductId) ? 'selected' : '';
+    const selected = String(product.id) === String(effectiveSelectedProductId) ? 'selected' : '';
     return `<option value="${escapeHtml(product.id)}" ${selected}>${escapeHtml(product.name || product.id)}</option>`;
   }).join('');
 
   let accountPanel = [
     '<section class="panel">',
     '  <div class="panel-head">',
-    '    <h2>Kho account</h2>',
+    '    <div>',
+    '      <h2>Kho account</h2>',
+    '      <p class="panel-subtitle">Chọn sản phẩm key/account, thêm dữ liệu kho và theo dõi trạng thái used.</p>',
+    '    </div>',
     `    <form class="inline-form" method="get" action="${escapeHtml(adminDashboardPath)}">`,
     '      <input type="hidden" name="tab" value="accounts" />',
     `      <select name="product_id">${accountOptions || '<option value="">(không có sản phẩm KEY/ACCOUNT)</option>'}</select>`,
@@ -1687,7 +1778,9 @@ function renderAdminDashboardPage({
   if (selectedProduct && accountSummary) {
     const accountRows = (accountSummary.preview || []).map((row, index) => {
       const parsed = parseAccountData(row.account_data);
-      const status = row.is_used ? 'used' : 'available';
+      const statusBadge = row.is_used
+        ? '<span class="status-badge cancelled">used</span>'
+        : '<span class="status-badge paid">available</span>';
       const orderCell = row.used_order_id ? `<code>${escapeHtml(row.used_order_id)}</code>` : '-';
       return [
         '<tr>',
@@ -1695,15 +1788,19 @@ function renderAdminDashboardPage({
         `  <td>${escapeHtml(parsed.account)}</td>`,
         `  <td>${escapeHtml(parsed.password)}</td>`,
         `  <td>${escapeHtml(parsed.twofa)}</td>`,
-        `  <td>${escapeHtml(status)}</td>`,
+        `  <td>${statusBadge}</td>`,
         `  <td>${orderCell}</td>`,
         '</tr>',
       ].join('\n');
     }).join('\n');
 
     accountPanel += [
-      `  <p><strong>${escapeHtml(selectedProduct.name)}</strong> | Available: ${accountSummary.available} | Used: ${accountSummary.used} | Stock(products): ${Number(selectedProduct.stock_quantity || 0)}</p>`,
-      `  <form method="post" action="${escapeHtml(`${adminDashboardPath}/account-add`)}">`,
+      '  <div class="account-summary">',
+      `    <div class="tagline"><strong>${escapeHtml(selectedProduct.name)}</strong><span class="tag">Stock products: ${escapeHtml(String(Number(selectedProduct.stock_quantity || 0)))}</span></div>`,
+      `    <span class="status-badge paid">Available: ${escapeHtml(String(accountSummary.available))}</span>`,
+      `    <span class="status-badge cancelled">Used: ${escapeHtml(String(accountSummary.used))}</span>`,
+      '  </div>',
+      `  <form class="account-form" method="post" action="${escapeHtml(`${adminDashboardPath}/account-add`)}">`,
       `    <input type="hidden" name="product_id" value="${escapeHtml(selectedProduct.id)}" />`,
       '    <textarea name="account_lines" rows="8" placeholder="Mỗi dòng 1 account. Ví dụ: email@gmail.com|MatKhau|2FA"></textarea>',
       '    <button type="submit">Thêm vào kho</button>',
@@ -1711,7 +1808,7 @@ function renderAdminDashboardPage({
       `  <form class="inline-form" method="post" action="${escapeHtml(`${adminDashboardPath}/product-sync`)}">`,
       `    <input type="hidden" name="product_id" value="${escapeHtml(selectedProduct.id)}" />`,
       '    <input type="hidden" name="tab" value="accounts" />',
-      '    <button type="submit">Sync stock từ kho account</button>',
+      '    <button class="btn-small btn-action btn-neutral" type="submit">Sync stock từ kho account</button>',
       '  </form>',
       '  <div class="table-wrap">',
       '    <table>',
@@ -1738,46 +1835,95 @@ function renderAdminDashboardPage({
     '  <meta charset="utf-8" />',
     '  <meta name="viewport" content="width=device-width, initial-scale=1" />',
     '  <title>Admin Dashboard</title>',
+    '  <link rel="preconnect" href="https://fonts.googleapis.com" />',
+    '  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />',
+    '  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />',
     '  <style>',
-    '    :root { --bg: #eef2f8; --panel: #ffffff; --line: #d4dbe6; --text: #122132; --muted: #5e6b79; --brand: #1f7aec; --danger: #b42318; }',
-    '    body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; color: var(--text); background: radial-gradient(circle at top right, #dce8ff, transparent 45%), var(--bg); }',
-    '    .wrap { max-width: 1300px; margin: 20px auto 40px; padding: 0 18px; }',
-    '    header { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 14px; }',
-    '    h1 { margin: 0; font-size: 28px; }',
-    '    .tabs { display: flex; gap: 8px; }',
-    '    .tab { text-decoration: none; border: 1px solid var(--line); padding: 8px 12px; border-radius: 999px; color: var(--text); background: #fff; }',
-    '    .tab.active { background: var(--brand); border-color: var(--brand); color: #fff; }',
-    '    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 14px; box-shadow: 0 8px 26px rgba(18, 33, 50, 0.08); }',
-    '    .panel-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }',
-    '    .panel h2 { margin: 0; font-size: 20px; }',
-    '    .table-wrap { overflow-x: auto; }',
-    '    table { width: 100%; border-collapse: collapse; }',
-    '    th, td { border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; padding: 8px; font-size: 13px; }',
-    '    th { font-size: 12px; letter-spacing: 0.03em; color: var(--muted); text-transform: uppercase; }',
+    '    :root { --bg: #edf4ff; --text: #10233a; --muted: #61758d; --panel: #ffffff; --line: #d6e2ee; --brand: #0f8a7f; --brand-dark: #0a6f66; --accent: #ff8a24; --danger: #b42318; --danger-soft: #ffe5e1; --ok: #067647; --ok-soft: #dcfae6; }',
+    '    * { box-sizing: border-box; }',
+    '    body { margin: 0; font-family: "IBM Plex Sans", sans-serif; color: var(--text); background: radial-gradient(75rem 28rem at 0% -5%, #c7e5ff, transparent 58%), radial-gradient(70rem 24rem at 100% -15%, #d8fff4, transparent 58%), var(--bg); }',
+    '    .wrap { max-width: 1440px; margin: 16px auto 32px; padding: 0 16px; }',
+    '    .hero { display: grid; gap: 10px; margin-bottom: 14px; padding: 16px; border: 1px solid var(--line); border-radius: 18px; background: linear-gradient(115deg, rgba(15,138,127,0.1), rgba(255,138,36,0.12)); }',
+    '    .hero h1 { margin: 0; font-family: "Space Grotesk", sans-serif; font-size: 30px; line-height: 1.05; }',
+    '    .hero p { margin: 0; color: #274765; font-size: 14px; }',
+    '    .top-actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }',
+    '    .tabs { display: inline-flex; background: rgba(255,255,255,0.65); border: 1px solid rgba(16,35,58,0.12); border-radius: 999px; padding: 4px; gap: 4px; backdrop-filter: blur(6px); }',
+    '    .tab { text-decoration: none; border-radius: 999px; padding: 8px 14px; color: #1b3550; font-weight: 600; font-size: 14px; }',
+    '    .tab.active { background: #fff; color: #0a4e48; box-shadow: 0 4px 12px rgba(0,0,0,0.09); }',
+    '    .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 12px 0; }',
+    '    .stat-card { border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px; background: #fff; min-height: 84px; display: grid; align-content: center; }',
+    '    .stat-card h3 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); }',
+    '    .stat-card p { margin: 4px 0 0; font-family: "Space Grotesk", sans-serif; font-size: 27px; line-height: 1; }',
+    '    .tone-blue { background: linear-gradient(160deg, #ffffff, #edf6ff); }',
+    '    .tone-amber { background: linear-gradient(160deg, #ffffff, #fff5e8); }',
+    '    .tone-green { background: linear-gradient(160deg, #ffffff, #ebfff5); }',
+    '    .tone-teal { background: linear-gradient(160deg, #ffffff, #eafffb); }',
+    '    .tone-red { background: linear-gradient(160deg, #ffffff, #fff0ef); }',
+    '    .tone-purple { background: linear-gradient(160deg, #ffffff, #f5f2ff); }',
+    '    .tone-gray { background: linear-gradient(160deg, #ffffff, #f4f6f9); }',
+    '    .alert { border-radius: 12px; padding: 10px 12px; margin: 8px 0; font-size: 14px; }',
+    '    .alert-info { background: #dff4ff; color: #0c4a6e; border: 1px solid #c1e8ff; }',
+    '    .alert-error { background: #ffe7e4; color: var(--danger); border: 1px solid #fbcfca; }',
+    '    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 14px; box-shadow: 0 10px 24px rgba(18,35,58,0.08); }',
+    '    .panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }',
+    '    .panel h2 { margin: 0; font-family: "Space Grotesk", sans-serif; font-size: 24px; }',
+    '    .panel-subtitle { margin: 5px 0 0; color: var(--muted); font-size: 14px; }',
+    '    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }',
+    '    .chip { display: inline-flex; align-items: center; padding: 6px 11px; border-radius: 999px; border: 1px solid var(--line); color: #274765; text-decoration: none; font-size: 12px; font-weight: 600; background: #f9fcff; }',
+    '    .chip.active { background: #e1fffa; border-color: #8cd5cb; color: #0a6159; }',
+    '    .table-wrap { overflow: auto; border: 1px solid #e5edf4; border-radius: 14px; }',
+    '    table { width: 100%; border-collapse: collapse; min-width: 940px; }',
+    '    thead th { position: sticky; top: 0; z-index: 2; background: #f8fbff; }',
+    '    th, td { border-bottom: 1px solid #edf2f7; text-align: left; vertical-align: top; padding: 9px 10px; font-size: 13px; }',
+    '    th { font-size: 11px; letter-spacing: 0.03em; text-transform: uppercase; color: #64748b; }',
+    '    tbody tr:nth-child(even) { background: #fcfeff; }',
+    '    .id-stack { display: grid; gap: 2px; }',
+    '    .id-stack strong { font-size: 13px; }',
+    '    code { font-size: 11px; color: #47627c; }',
+    '    .status-badge, .tag, .stock-badge { display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid transparent; }',
+    '    .status-badge.neutral { background: #eef2f6; border-color: #d7dee6; color: #425466; }',
+    '    .status-badge.draft { background: #f2f4f7; border-color: #d0d6dd; color: #344054; }',
+    '    .status-badge.confirmed { background: #fff4df; border-color: #ffd7a0; color: #8a4800; }',
+    '    .status-badge.paid { background: var(--ok-soft); border-color: #99e9be; color: var(--ok); }',
+    '    .status-badge.cancelled { background: var(--danger-soft); border-color: #f4b8b3; color: var(--danger); }',
+    '    .tag { background: #f1f6fd; border-color: #d4e1ef; color: #274765; }',
+    '    .stock-badge { background: #ecfdf3; border-color: #a9e6c0; color: #067647; }',
+    '    .stock-badge.low { background: #fff1ee; border-color: #f7bbb3; color: #b42318; }',
     '    .actions { display: flex; flex-wrap: wrap; gap: 6px; }',
-    '    input[type="number"], select, textarea { border: 1px solid var(--line); border-radius: 8px; padding: 7px 8px; font-size: 13px; }',
-    '    textarea { width: 100%; box-sizing: border-box; margin: 8px 0; font-family: Consolas, monospace; }',
-    '    button, .link-like { background: var(--brand); color: #fff; border: none; border-radius: 8px; padding: 7px 10px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }',
-    '    .btn-small { font-size: 12px; padding: 5px 8px; }',
     '    .inline-form { display: inline-flex; gap: 8px; align-items: center; flex-wrap: wrap; }',
-    '    .checkbox { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }',
-    '    .alert { border-radius: 10px; padding: 10px 12px; margin: 10px 0; }',
-    '    .alert-info { background: #dff3ff; color: #0c4a6e; }',
-    '    .alert-error { background: #fee4e2; color: var(--danger); }',
-    '    .top-actions { display: flex; gap: 10px; align-items: center; }',
-    '    code { font-size: 12px; }',
-    '    @media (max-width: 768px) { h1 { font-size: 22px; } .panel { padding: 10px; } }',
-    '  </style>',
+    '    .product-form label { display: inline-flex; align-items: center; gap: 6px; color: #475467; font-size: 12px; }',
+    '    input[type="number"], select, textarea { border: 1px solid #cdd9e5; border-radius: 10px; padding: 7px 9px; font-size: 13px; color: var(--text); background: #fff; }',
+    '    textarea { width: 100%; min-height: 170px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }',
+    '    input:focus, select:focus, textarea:focus { outline: 2px solid #b5ded8; outline-offset: 1px; border-color: #8bcfc6; }',
+    '    button, .link-like { border: none; border-radius: 10px; background: var(--brand); color: #fff; padding: 8px 10px; font-weight: 600; font-size: 13px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; transition: transform .08s ease, filter .15s ease; }',
+    '    button:hover, .link-like:hover { filter: brightness(0.96); }',
+    '    button:active, .link-like:active { transform: translateY(1px); }',
+    '    .btn-small { font-size: 12px; padding: 6px 8px; }',
+    '    .btn-action.btn-confirm { background: #b45309; }',
+    '    .btn-action.btn-paid { background: #067647; }',
+    '    .btn-action.btn-cancel { background: #b42318; }',
+    '    .btn-action.btn-neutral { background: #475467; }',
+    '    .checkbox { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: #475467; }',
+    '    .account-summary { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }',
+    '    .tagline { display: inline-flex; gap: 8px; align-items: center; margin-right: 8px; }',
+    '    .account-form { display: grid; gap: 8px; margin-bottom: 10px; }',
+    '    .actions-row { display: flex; gap: 8px; flex-wrap: wrap; }',
+    '    @media (max-width: 930px) { .hero h1 { font-size: 25px; } .tabs { width: 100%; justify-content: space-between; } .tab { flex: 1; text-align: center; } .panel { padding: 10px; } }',
+  '  </style>',
     '</head>',
     '<body>',
     '  <div class="wrap">',
-    '    <header>',
-    '      <h1>Dashboard Admin</h1>',
+    '    <section class="hero">',
     '      <div class="top-actions">',
+    '        <div>',
+    '          <h1>Admin Control Center</h1>',
+    '          <p>Ưu tiên thao tác nhanh: cập nhật trạng thái đơn, quản lý giá/tồn, và đồng bộ kho account.</p>',
+    '        </div>',
     `        <form method="post" action="${escapeHtml(`${adminDashboardPath}/logout`)}"><button type="submit">Đăng xuất</button></form>`,
     '      </div>',
-    '    </header>',
-    `    <nav class="tabs">${nav}</nav>`,
+    `      <nav class="tabs">${nav}</nav>`,
+    '    </section>',
+    `    <section class="stat-grid">${statCardsHtml}</section>`,
     `    ${infoBlock}`,
     `    ${errorBlock}`,
     `    ${panelContent}`,
@@ -2003,10 +2149,15 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
   const statusFilter = normalizeDashboardOrderStatus(requestUrl.searchParams.get('status_filter'));
   const infoMessage = String(requestUrl.searchParams.get('msg') || '').trim();
   const errorMessage = String(requestUrl.searchParams.get('err') || '').trim();
-  const selectedProductId = String(requestUrl.searchParams.get('product_id') || '').trim();
+  const selectedProductIdRaw = String(requestUrl.searchParams.get('product_id') || '').trim();
 
   try {
     const products = await loadDashboardProducts();
+    const accountProductIds = products
+      .filter((product) => usesAccountInventory(product))
+      .map((product) => String(product.id || '').trim())
+      .filter(Boolean);
+    const selectedProductId = selectedProductIdRaw || accountProductIds[0] || '';
     let orders = [];
     if (tab === 'orders') {
       orders = await loadDashboardOrders(statusFilter, 120);
@@ -2042,7 +2193,7 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       errorMessage: `Lỗi tải dashboard: ${String(error.message || 'unknown')}`,
       orders: [],
       products: [],
-      selectedProductId,
+      selectedProductId: selectedProductIdRaw,
       selectedProduct: null,
       accountSummary: null,
     }));
