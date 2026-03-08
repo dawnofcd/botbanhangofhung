@@ -14,6 +14,23 @@ const mmobankBankCode = process.env.MMOBANK_BANK_CODE || process.env.SEPAY_BANK_
 const mmobankAccountName = process.env.MMOBANK_ACCOUNT_NAME || process.env.SEPAY_ACCOUNT_NAME || '';
 const mmobankWebhookPath = process.env.MMOBANK_WEBHOOK_PATH || process.env.SEPAY_WEBHOOK_PATH || '/mmobank/webhook';
 const webhookPort = Number(process.env.PORT || process.env.WEBHOOK_PORT || 3000);
+const adminDashboardPath = (() => {
+  const raw = String(process.env.ADMIN_DASHBOARD_PATH || '/admin').trim();
+  if (!raw) {
+    return '/admin';
+  }
+  const withLeadingSlash = raw.startsWith('/') ? raw : `/${raw}`;
+  if (withLeadingSlash.length > 1 && withLeadingSlash.endsWith('/')) {
+    return withLeadingSlash.slice(0, -1);
+  }
+  return withLeadingSlash;
+})();
+const adminDashboardKey = String(process.env.ADMIN_DASHBOARD_KEY || adminSecretKey || '').trim();
+const adminDashboardSessionTtlSecondsRaw = Number(process.env.ADMIN_DASHBOARD_SESSION_TTL_SECONDS || 43200);
+const adminDashboardSessionTtlSeconds = Number.isFinite(adminDashboardSessionTtlSecondsRaw) && adminDashboardSessionTtlSecondsRaw > 0
+  ? Math.round(adminDashboardSessionTtlSecondsRaw)
+  : 43200;
+const adminDashboardSessionCookieName = 'admin_dash_session';
 const supportZaloNumber = process.env.SUPPORT_ZALO || '0563228054';
 const supportShopName = process.env.SUPPORT_SHOP_NAME || 'Tài Nguyên Hero';
 const supportZaloGroup = process.env.SUPPORT_ZALO_GROUP || '';
@@ -23,6 +40,10 @@ const paymentTimeoutSeconds = Number.isFinite(paymentTimeoutSecondsRaw) && payme
   ? Math.round(paymentTimeoutSecondsRaw)
   : 60;
 const paymentTimeoutMs = paymentTimeoutSeconds * 1000;
+const orderExpirySweepIntervalMsRaw = Number(process.env.ORDER_EXPIRY_SWEEP_INTERVAL_MS || 15000);
+const orderExpirySweepIntervalMs = Number.isFinite(orderExpirySweepIntervalMsRaw) && orderExpirySweepIntervalMsRaw >= 5000
+  ? Math.round(orderExpirySweepIntervalMsRaw)
+  : 15000;
 const notifyAllDelayMsRaw = Number(process.env.NOTIFY_ALL_DELAY_MS || 35);
 const notifyAllDelayMs = Number.isFinite(notifyAllDelayMsRaw) && notifyAllDelayMsRaw >= 0
   ? Math.round(notifyAllDelayMsRaw)
@@ -69,6 +90,9 @@ const pendingAdminInputs = new Map();
 const pendingUserInputs = new Map();
 const orderPaymentMessageRefs = new Map();
 const orderExpiryTimers = new Map();
+const adminDashboardSessions = new Map();
+let orderExpirySweepTimer = null;
+let orderExpirySweepInFlight = false;
 const inFlightCallbackUsers = new Set();
 const ORDER_MESSAGE_REF_PREFIX = '__MSGREF__';
 
@@ -339,6 +363,76 @@ async function restorePendingOrderExpirySchedules() {
   }
 
   console.log(`Order expiry restored: scheduled=${scheduledCount}, expired_now=${expiredNowCount}`);
+}
+
+async function expireOverdueUnpaidOrders(limit = 5000) {
+  const maxRows = Number.isFinite(Number(limit)) ? Math.max(1, Math.round(Number(limit))) : 5000;
+  const { data: pendingOrders, error } = await db
+    .from('orders')
+    .select('id,created_at')
+    .in('status', ['draft', 'confirmed'])
+    .order('created_at', { ascending: true })
+    .limit(maxRows);
+  if (error) {
+    throw error;
+  }
+
+  const now = Date.now();
+  let expiredCount = 0;
+  for (const order of (pendingOrders || [])) {
+    const createdAtMs = Date.parse(String(order.created_at || ''));
+    if (!Number.isFinite(createdAtMs)) {
+      continue;
+    }
+    if ((now - createdAtMs) < paymentTimeoutMs) {
+      break;
+    }
+
+    await expireUnpaidOrder(order.id);
+    expiredCount += 1;
+  }
+  return expiredCount;
+}
+
+async function runOrderExpirySweep() {
+  if (orderExpirySweepInFlight) {
+    return;
+  }
+
+  orderExpirySweepInFlight = true;
+  try {
+    const expiredCount = await expireOverdueUnpaidOrders();
+    if (expiredCount > 0) {
+      console.log(`Order expiry sweep auto-cancelled: ${expiredCount}`);
+    }
+  } catch (error) {
+    console.error('Order expiry sweep failed:', error);
+  } finally {
+    orderExpirySweepInFlight = false;
+  }
+}
+
+function startOrderExpirySweeper() {
+  if (orderExpirySweepTimer) {
+    return;
+  }
+
+  orderExpirySweepTimer = setInterval(() => {
+    runOrderExpirySweep();
+  }, orderExpirySweepIntervalMs);
+  if (typeof orderExpirySweepTimer.unref === 'function') {
+    orderExpirySweepTimer.unref();
+  }
+  runOrderExpirySweep();
+}
+
+function stopOrderExpirySweeper() {
+  if (!orderExpirySweepTimer) {
+    return;
+  }
+
+  clearInterval(orderExpirySweepTimer);
+  orderExpirySweepTimer = null;
 }
 
 function parseAccountData(rawAccountData) {
@@ -628,9 +722,18 @@ function getLocale(userRecord) {
   return userRecord?.language_code === 'en' ? 'en' : 'vi';
 }
 
-function isAdmin(ctx, userRecord) {
+function hasAdminIdentity(ctx, userRecord) {
   const telegramId = String(ctx.from.id);
   return runtimeAdminIds.has(telegramId) || userRecord?.role === 'admin';
+}
+
+function canUseNotifyAll(ctx, userRecord) {
+  return hasAdminIdentity(ctx, userRecord);
+}
+
+function isAdmin(ctx, userRecord) {
+  // Chat-admin features are disabled. Only /notifyall keeps separate permission.
+  return false;
 }
 
 function isSecretKeyValid(input) {
@@ -1099,10 +1202,852 @@ async function cancelOrderByUser(orderId, userId) {
   return { ok: true, alreadyCancelled: false, order: updatedOrder };
 }
 
+async function updateOrderStatusFromAdmin(orderId, status, changedByUserId = null, comment = 'Updated from admin panel') {
+  const targetStatus = String(status || '').trim().toLowerCase();
+  if (!['draft', 'confirmed', 'paid', 'cancelled'].includes(targetStatus)) {
+    return { ok: false, reason: 'invalid_status' };
+  }
+
+  const { data: currentOrder, error: currentOrderError } = await db
+    .from('orders')
+    .select('id,user_id,status,total_amount,currency')
+    .eq('id', orderId)
+    .maybeSingle();
+  if (currentOrderError) {
+    throw currentOrderError;
+  }
+  if (!currentOrder) {
+    return { ok: false, reason: 'not_found' };
+  }
+
+  const previousStatus = String(currentOrder.status || '').toLowerCase();
+  const { data: updated, error: updateError } = await db
+    .from('orders')
+    .update({ status: targetStatus })
+    .eq('id', orderId)
+    .select('id,user_id,status,total_amount,currency')
+    .single();
+  if (updateError) {
+    throw updateError;
+  }
+
+  await db.from('order_history').insert({
+    order_id: updated.id,
+    changed_by: changedByUserId,
+    status: targetStatus,
+    comment,
+  });
+
+  if (targetStatus === 'paid') {
+    clearOrderExpiryTimer(updated.id);
+    await deliverAutoAccountsAfterPaid(updated);
+    await clearOrderPaymentMessages(updated.id);
+  } else if (targetStatus === 'cancelled') {
+    clearOrderExpiryTimer(updated.id);
+    if (['draft', 'confirmed'].includes(previousStatus)) {
+      try {
+        await restoreStockFromOrderItems(updated.id);
+      } catch (restoreError) {
+        console.error('restoreStockFromOrderItems failed (admin cancel):', restoreError);
+      }
+    }
+    await clearOrderPaymentMessages(updated.id);
+  } else {
+    scheduleOrderExpiry(updated.id);
+  }
+
+  return { ok: true, order: updated, previousStatus };
+}
+
+async function notifyOrderOwnerStatusChanged(order) {
+  if (!order?.id || !order?.user_id) {
+    return;
+  }
+
+  const { data: owner } = await db
+    .from('users')
+    .select('telegram_id')
+    .eq('id', order.user_id)
+    .maybeSingle();
+
+  if (owner?.telegram_id) {
+    try {
+      await bot.telegram.sendMessage(
+        Number(owner.telegram_id),
+        `Đơn #${order.id} của bạn đã được cập nhật: ${order.status}`,
+      );
+    } catch (errorNotify) {
+      // no-op
+    }
+  }
+}
+
 function sendJson(res, statusCode, payload) {
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(body);
+}
+
+function sendHtml(res, statusCode, html, extraHeaders = {}) {
+  res.writeHead(statusCode, {
+    'Content-Type': 'text/html; charset=utf-8',
+    ...extraHeaders,
+  });
+  res.end(html);
+}
+
+function redirectResponse(res, location, extraHeaders = {}) {
+  res.writeHead(302, {
+    Location: location,
+    ...extraHeaders,
+  });
+  res.end();
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatDashboardDateTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return '-';
+  }
+  return date.toLocaleString('vi-VN', { hour12: false, timeZone: 'Asia/Ho_Chi_Minh' });
+}
+
+function parseCookieHeader(cookieHeader) {
+  const cookies = new Map();
+  const raw = String(cookieHeader || '').trim();
+  if (!raw) {
+    return cookies;
+  }
+
+  for (const part of raw.split(';')) {
+    const [nameRaw, ...valueParts] = part.split('=');
+    const name = String(nameRaw || '').trim();
+    if (!name) {
+      continue;
+    }
+    cookies.set(name, valueParts.join('=').trim());
+  }
+  return cookies;
+}
+
+function buildAdminDashboardSessionCookie(token) {
+  return `${adminDashboardSessionCookieName}=${token}; Path=${adminDashboardPath}; HttpOnly; SameSite=Lax; Max-Age=${adminDashboardSessionTtlSeconds}`;
+}
+
+function buildClearAdminDashboardSessionCookie() {
+  return `${adminDashboardSessionCookieName}=; Path=${adminDashboardPath}; HttpOnly; SameSite=Lax; Max-Age=0`;
+}
+
+function clearExpiredAdminDashboardSessions() {
+  const now = Date.now();
+  for (const [token, session] of adminDashboardSessions.entries()) {
+    if (!session?.expiresAt || session.expiresAt <= now) {
+      adminDashboardSessions.delete(token);
+    }
+  }
+}
+
+function getAdminDashboardSession(req) {
+  clearExpiredAdminDashboardSessions();
+  const cookies = parseCookieHeader(req.headers?.cookie);
+  const token = String(cookies.get(adminDashboardSessionCookieName) || '').trim();
+  if (!token) {
+    return null;
+  }
+
+  const session = adminDashboardSessions.get(token);
+  if (!session) {
+    return null;
+  }
+
+  if (session.expiresAt <= Date.now()) {
+    adminDashboardSessions.delete(token);
+    return null;
+  }
+
+  return { token, ...session };
+}
+
+function createAdminDashboardSession() {
+  clearExpiredAdminDashboardSessions();
+  const token = crypto.randomBytes(24).toString('hex');
+  const expiresAt = Date.now() + (adminDashboardSessionTtlSeconds * 1000);
+  adminDashboardSessions.set(token, { expiresAt });
+  return token;
+}
+
+function revokeAdminDashboardSession(req) {
+  const session = getAdminDashboardSession(req);
+  if (session?.token) {
+    adminDashboardSessions.delete(session.token);
+  }
+}
+
+async function readRawRequestBody(req, maxBytes = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let rawBody = '';
+    req.on('data', (chunk) => {
+      rawBody += chunk;
+      if (rawBody.length > maxBytes) {
+        reject(new Error('payload_too_large'));
+        req.destroy();
+      }
+    });
+
+    req.on('end', () => {
+      resolve(rawBody);
+    });
+
+    req.on('error', (error) => {
+      reject(error);
+    });
+  });
+}
+
+function parseFormUrlEncoded(rawBody) {
+  const params = new URLSearchParams(String(rawBody || ''));
+  const data = {};
+  for (const [key, value] of params.entries()) {
+    data[key] = value;
+  }
+  return data;
+}
+
+function normalizeDashboardTab(rawTab) {
+  const tab = String(rawTab || '').trim().toLowerCase();
+  if (tab === 'products' || tab === 'accounts') {
+    return tab;
+  }
+  return 'orders';
+}
+
+function normalizeDashboardOrderStatus(rawStatus) {
+  const status = String(rawStatus || '').trim().toLowerCase();
+  if (['draft', 'confirmed', 'paid', 'cancelled'].includes(status)) {
+    return status;
+  }
+  return 'all';
+}
+
+function buildAdminDashboardUrl(params = {}) {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value == null) {
+      continue;
+    }
+    const stringValue = String(value).trim();
+    if (!stringValue) {
+      continue;
+    }
+    search.set(key, stringValue);
+  }
+  const query = search.toString();
+  return query ? `${adminDashboardPath}?${query}` : adminDashboardPath;
+}
+
+async function loadDashboardOrders(statusFilter = 'all', limit = 80) {
+  const safeStatus = normalizeDashboardOrderStatus(statusFilter);
+  const maxRows = Number.isFinite(Number(limit)) ? Math.max(1, Math.round(Number(limit))) : 80;
+  const query = db
+    .from('orders')
+    .select('id,user_id,status,total_amount,currency,payment_method,created_at')
+    .order('created_at', { ascending: false })
+    .limit(maxRows);
+  if (safeStatus !== 'all') {
+    query.eq('status', safeStatus);
+  }
+
+  const { data, error } = await query;
+  if (error) {
+    throw error;
+  }
+
+  const rows = await attachBuyerToOrders(data || []);
+  if (!rows.length) {
+    return rows;
+  }
+
+  const previewByOrderId = await loadOrderItemPreviewByOrderIds(rows.map((row) => row.id));
+  return rows.map((row) => ({
+    ...row,
+    item_preview: previewByOrderId.get(row.id) || null,
+  }));
+}
+
+async function loadDashboardProducts(limit = 120) {
+  const maxRows = Number.isFinite(Number(limit)) ? Math.max(1, Math.round(Number(limit))) : 120;
+  const { data, error } = await db
+    .from('products')
+    .select('id,name,price,currency,stock_quantity,is_active,delivery_type,updated_at')
+    .order('updated_at', { ascending: false })
+    .limit(maxRows);
+
+  if (error) {
+    throw error;
+  }
+
+  return data || [];
+}
+
+function renderAdminDashboardLoginPage(errorText = '') {
+  const errorBlock = errorText
+    ? `<div class="alert alert-error">${escapeHtml(errorText)}</div>`
+    : '';
+
+  return [
+    '<!doctype html>',
+    '<html lang="vi">',
+    '<head>',
+    '  <meta charset="utf-8" />',
+    '  <meta name="viewport" content="width=device-width, initial-scale=1" />',
+    '  <title>Admin Dashboard Login</title>',
+    '  <style>',
+    '    body { font-family: "Segoe UI", Arial, sans-serif; background: #f4f6fb; margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }',
+    '    .card { width: min(420px, 92vw); background: #fff; border-radius: 16px; padding: 28px; box-shadow: 0 14px 40px rgba(16, 24, 40, 0.14); }',
+    '    h1 { margin: 0 0 8px; font-size: 24px; }',
+    '    p { margin: 0 0 18px; color: #5f6b7a; }',
+    '    input { width: 100%; padding: 12px; font-size: 15px; border-radius: 10px; border: 1px solid #d5dbe7; margin-bottom: 12px; box-sizing: border-box; }',
+    '    button { width: 100%; border: none; border-radius: 10px; background: #1f7aec; color: #fff; font-weight: 600; padding: 12px; cursor: pointer; }',
+    '    .alert { border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; font-size: 14px; }',
+    '    .alert-error { background: #fee4e2; color: #b42318; }',
+    '  </style>',
+    '</head>',
+    '<body>',
+    '  <main class="card">',
+    '    <h1>Admin Dashboard</h1>',
+    '    <p>Nhập key để truy cập trang quản trị.</p>',
+    `    ${errorBlock}`,
+    `    <form method="post" action="${escapeHtml(`${adminDashboardPath}/login`)}">`,
+    '      <input name="key" type="password" placeholder="ADMIN_DASHBOARD_KEY" autocomplete="off" required />',
+    '      <button type="submit">Đăng nhập</button>',
+    '    </form>',
+    '  </main>',
+    '</body>',
+    '</html>',
+  ].join('\n');
+}
+
+function renderAdminDashboardPage({
+  tab = 'orders',
+  statusFilter = 'all',
+  infoMessage = '',
+  errorMessage = '',
+  orders = [],
+  products = [],
+  selectedProductId = '',
+  selectedProduct = null,
+  accountSummary = null,
+}) {
+  const safeTab = normalizeDashboardTab(tab);
+  const safeStatusFilter = normalizeDashboardOrderStatus(statusFilter);
+  const orderStatusOptions = ['all', 'draft', 'confirmed', 'paid', 'cancelled'];
+  const infoBlock = infoMessage ? `<div class="alert alert-info">${escapeHtml(infoMessage)}</div>` : '';
+  const errorBlock = errorMessage ? `<div class="alert alert-error">${escapeHtml(errorMessage)}</div>` : '';
+
+  const navOrdersClass = safeTab === 'orders' ? 'tab active' : 'tab';
+  const navProductsClass = safeTab === 'products' ? 'tab active' : 'tab';
+  const navAccountsClass = safeTab === 'accounts' ? 'tab active' : 'tab';
+
+  const nav = [
+    `<a class="${navOrdersClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'orders', status_filter: safeStatusFilter }))}">Đơn hàng</a>`,
+    `<a class="${navProductsClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'products' }))}">Sản phẩm</a>`,
+    `<a class="${navAccountsClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'accounts', product_id: selectedProductId }))}">Kho account</a>`,
+  ].join('');
+
+  const statusFilterOptions = orderStatusOptions.map((status) => {
+    const selectedAttr = safeStatusFilter === status ? 'selected' : '';
+    return `<option value="${status}" ${selectedAttr}>${status.toUpperCase()}</option>`;
+  }).join('');
+
+  const orderRows = orders.map((order) => {
+    const buyer = formatBuyerLabel(order);
+    const itemPreview = order.item_preview
+      ? `${order.item_preview.firstProductName || '(N/A)'} x${order.item_preview.totalQuantity || 0}`
+      : '(chưa có dòng sản phẩm)';
+    const actionStatuses = ['confirmed', 'paid', 'cancelled'].filter((status) => status !== String(order.status || '').toLowerCase());
+    const actionForms = actionStatuses.map((actionStatus) => {
+      return [
+        `<form method="post" action="${escapeHtml(`${adminDashboardPath}/order-status`)}">`,
+        `  <input type="hidden" name="order_id" value="${escapeHtml(order.id)}" />`,
+        `  <input type="hidden" name="status" value="${escapeHtml(actionStatus)}" />`,
+        `  <input type="hidden" name="status_filter" value="${escapeHtml(safeStatusFilter)}" />`,
+        '  <button class="btn-small" type="submit">', `    ${escapeHtml(actionStatus)}`, '  </button>',
+        '</form>',
+      ].join('\n');
+    }).join('\n');
+
+    return [
+      '<tr>',
+      `  <td><code>${escapeHtml(order.id)}</code></td>`,
+      `  <td>${escapeHtml(buyer)}</td>`,
+      `  <td>${escapeHtml(itemPreview)}</td>`,
+      `  <td>${escapeHtml(String(order.status || '').toLowerCase())}</td>`,
+      `  <td>${escapeHtml(formatPriceVnd(order.total_amount))} ${escapeHtml(order.currency || 'VND')}</td>`,
+      `  <td>${escapeHtml(formatDashboardDateTime(order.created_at))}</td>`,
+      `  <td class="actions">${actionForms || '-'}</td>`,
+      '</tr>',
+    ].join('\n');
+  }).join('\n');
+
+  const orderPanel = [
+    '<section class="panel">',
+    '  <div class="panel-head">',
+    '    <h2>Đơn hàng</h2>',
+    `    <form method="get" action="${escapeHtml(adminDashboardPath)}" class="inline-form">`,
+    '      <input type="hidden" name="tab" value="orders" />',
+    `      <label>Lọc trạng thái <select name="status_filter">${statusFilterOptions}</select></label>`,
+    '      <button type="submit">Lọc</button>',
+    '    </form>',
+    '  </div>',
+    '  <div class="table-wrap">',
+    '    <table>',
+    '      <thead><tr><th>ID</th><th>Người mua</th><th>Sản phẩm</th><th>Trạng thái</th><th>Tổng</th><th>Tạo lúc</th><th>Hành động</th></tr></thead>',
+    `      <tbody>${orderRows || '<tr><td colspan="7">Không có dữ liệu.</td></tr>'}</tbody>`,
+    '    </table>',
+    '  </div>',
+    '</section>',
+  ].join('\n');
+
+  const productRows = products.map((product) => {
+    const category = inferProductCategoryKey(product);
+    const usingAccounts = usesAccountInventory(product);
+    const checkedAttr = product.is_active ? 'checked' : '';
+    const syncForm = usingAccounts
+      ? [
+        `<form method="post" action="${escapeHtml(`${adminDashboardPath}/product-sync`)}">`,
+        `  <input type="hidden" name="product_id" value="${escapeHtml(product.id)}" />`,
+        '  <button class="btn-small" type="submit">Sync kho</button>',
+        '</form>',
+      ].join('\n')
+      : '';
+    const accountLink = usingAccounts
+      ? `<a class="btn-small link-like" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'accounts', product_id: product.id }))}">Mở kho</a>`
+      : '';
+
+    return [
+      '<tr>',
+      `  <td><code>${escapeHtml(product.id)}</code></td>`,
+      `  <td>${escapeHtml(product.name || '')}</td>`,
+      `  <td>${escapeHtml(category)}</td>`,
+      `  <td>${escapeHtml(product.delivery_type || '')}</td>`,
+      '  <td>',
+      `    <form class="inline-form" method="post" action="${escapeHtml(`${adminDashboardPath}/product-update`)}">`,
+      `      <input type="hidden" name="product_id" value="${escapeHtml(product.id)}" />`,
+      `      <input type="number" name="price" min="0" step="1" value="${escapeHtml(Math.round(Number(product.price || 0)))}" />`,
+      `      <input type="number" name="stock_quantity" min="0" step="1" value="${escapeHtml(Number(product.stock_quantity || 0))}" />`,
+      `      <label class="checkbox"><input type="checkbox" name="is_active" value="1" ${checkedAttr} />Active</label>`,
+      '      <button type="submit">Lưu</button>',
+      '    </form>',
+      '  </td>',
+      `  <td>${escapeHtml(formatDashboardDateTime(product.updated_at))}</td>`,
+      `  <td class="actions">${syncForm}${accountLink}</td>`,
+      '</tr>',
+    ].join('\n');
+  }).join('\n');
+
+  const productPanel = [
+    '<section class="panel">',
+    '  <div class="panel-head"><h2>Sản phẩm</h2></div>',
+    '  <div class="table-wrap">',
+    '    <table>',
+    '      <thead><tr><th>ID</th><th>Tên</th><th>Loại</th><th>Delivery</th><th>Giá / Tồn / Active</th><th>Cập nhật</th><th>Kho account</th></tr></thead>',
+    `      <tbody>${productRows || '<tr><td colspan="7">Không có dữ liệu.</td></tr>'}</tbody>`,
+    '    </table>',
+    '  </div>',
+    '</section>',
+  ].join('\n');
+
+  const accountProducts = products.filter((product) => usesAccountInventory(product));
+  const accountOptions = accountProducts.map((product) => {
+    const selected = String(product.id) === String(selectedProductId) ? 'selected' : '';
+    return `<option value="${escapeHtml(product.id)}" ${selected}>${escapeHtml(product.name || product.id)}</option>`;
+  }).join('');
+
+  let accountPanel = [
+    '<section class="panel">',
+    '  <div class="panel-head">',
+    '    <h2>Kho account</h2>',
+    `    <form class="inline-form" method="get" action="${escapeHtml(adminDashboardPath)}">`,
+    '      <input type="hidden" name="tab" value="accounts" />',
+    `      <select name="product_id">${accountOptions || '<option value="">(không có sản phẩm KEY/ACCOUNT)</option>'}</select>`,
+    '      <button type="submit">Xem</button>',
+    '    </form>',
+    '  </div>',
+  ].join('\n');
+
+  if (selectedProduct && accountSummary) {
+    const accountRows = (accountSummary.preview || []).map((row, index) => {
+      const parsed = parseAccountData(row.account_data);
+      const status = row.is_used ? 'used' : 'available';
+      const orderCell = row.used_order_id ? `<code>${escapeHtml(row.used_order_id)}</code>` : '-';
+      return [
+        '<tr>',
+        `  <td>${index + 1}</td>`,
+        `  <td>${escapeHtml(parsed.account)}</td>`,
+        `  <td>${escapeHtml(parsed.password)}</td>`,
+        `  <td>${escapeHtml(parsed.twofa)}</td>`,
+        `  <td>${escapeHtml(status)}</td>`,
+        `  <td>${orderCell}</td>`,
+        '</tr>',
+      ].join('\n');
+    }).join('\n');
+
+    accountPanel += [
+      `  <p><strong>${escapeHtml(selectedProduct.name)}</strong> | Available: ${accountSummary.available} | Used: ${accountSummary.used} | Stock(products): ${Number(selectedProduct.stock_quantity || 0)}</p>`,
+      `  <form method="post" action="${escapeHtml(`${adminDashboardPath}/account-add`)}">`,
+      `    <input type="hidden" name="product_id" value="${escapeHtml(selectedProduct.id)}" />`,
+      '    <textarea name="account_lines" rows="8" placeholder="Mỗi dòng 1 account. Ví dụ: email@gmail.com|MatKhau|2FA"></textarea>',
+      '    <button type="submit">Thêm vào kho</button>',
+      '  </form>',
+      `  <form class="inline-form" method="post" action="${escapeHtml(`${adminDashboardPath}/product-sync`)}">`,
+      `    <input type="hidden" name="product_id" value="${escapeHtml(selectedProduct.id)}" />`,
+      '    <input type="hidden" name="tab" value="accounts" />',
+      '    <button type="submit">Sync stock từ kho account</button>',
+      '  </form>',
+      '  <div class="table-wrap">',
+      '    <table>',
+      '      <thead><tr><th>#</th><th>Account</th><th>Password</th><th>2FA</th><th>State</th><th>Order used</th></tr></thead>',
+      `      <tbody>${accountRows || '<tr><td colspan="6">Kho trống.</td></tr>'}</tbody>`,
+      '    </table>',
+      '  </div>',
+    ].join('\n');
+  } else {
+    accountPanel += '<p>Chọn sản phẩm KEY/ACCOUNT để xem kho.</p>';
+  }
+  accountPanel += '</section>';
+
+  const panelContent = safeTab === 'products'
+    ? productPanel
+    : safeTab === 'accounts'
+      ? accountPanel
+      : orderPanel;
+
+  return [
+    '<!doctype html>',
+    '<html lang="vi">',
+    '<head>',
+    '  <meta charset="utf-8" />',
+    '  <meta name="viewport" content="width=device-width, initial-scale=1" />',
+    '  <title>Admin Dashboard</title>',
+    '  <style>',
+    '    :root { --bg: #eef2f8; --panel: #ffffff; --line: #d4dbe6; --text: #122132; --muted: #5e6b79; --brand: #1f7aec; --danger: #b42318; }',
+    '    body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; color: var(--text); background: radial-gradient(circle at top right, #dce8ff, transparent 45%), var(--bg); }',
+    '    .wrap { max-width: 1300px; margin: 20px auto 40px; padding: 0 18px; }',
+    '    header { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 14px; }',
+    '    h1 { margin: 0; font-size: 28px; }',
+    '    .tabs { display: flex; gap: 8px; }',
+    '    .tab { text-decoration: none; border: 1px solid var(--line); padding: 8px 12px; border-radius: 999px; color: var(--text); background: #fff; }',
+    '    .tab.active { background: var(--brand); border-color: var(--brand); color: #fff; }',
+    '    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 14px; box-shadow: 0 8px 26px rgba(18, 33, 50, 0.08); }',
+    '    .panel-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }',
+    '    .panel h2 { margin: 0; font-size: 20px; }',
+    '    .table-wrap { overflow-x: auto; }',
+    '    table { width: 100%; border-collapse: collapse; }',
+    '    th, td { border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; padding: 8px; font-size: 13px; }',
+    '    th { font-size: 12px; letter-spacing: 0.03em; color: var(--muted); text-transform: uppercase; }',
+    '    .actions { display: flex; flex-wrap: wrap; gap: 6px; }',
+    '    input[type="number"], select, textarea { border: 1px solid var(--line); border-radius: 8px; padding: 7px 8px; font-size: 13px; }',
+    '    textarea { width: 100%; box-sizing: border-box; margin: 8px 0; font-family: Consolas, monospace; }',
+    '    button, .link-like { background: var(--brand); color: #fff; border: none; border-radius: 8px; padding: 7px 10px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }',
+    '    .btn-small { font-size: 12px; padding: 5px 8px; }',
+    '    .inline-form { display: inline-flex; gap: 8px; align-items: center; flex-wrap: wrap; }',
+    '    .checkbox { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }',
+    '    .alert { border-radius: 10px; padding: 10px 12px; margin: 10px 0; }',
+    '    .alert-info { background: #dff3ff; color: #0c4a6e; }',
+    '    .alert-error { background: #fee4e2; color: var(--danger); }',
+    '    .top-actions { display: flex; gap: 10px; align-items: center; }',
+    '    code { font-size: 12px; }',
+    '    @media (max-width: 768px) { h1 { font-size: 22px; } .panel { padding: 10px; } }',
+    '  </style>',
+    '</head>',
+    '<body>',
+    '  <div class="wrap">',
+    '    <header>',
+    '      <h1>Dashboard Admin</h1>',
+    '      <div class="top-actions">',
+    `        <form method="post" action="${escapeHtml(`${adminDashboardPath}/logout`)}"><button type="submit">Đăng xuất</button></form>`,
+    '      </div>',
+    '    </header>',
+    `    <nav class="tabs">${nav}</nav>`,
+    `    ${infoBlock}`,
+    `    ${errorBlock}`,
+    `    ${panelContent}`,
+    '  </div>',
+    '</body>',
+    '</html>',
+  ].join('\n');
+}
+
+async function handleAdminDashboardRequest(req, res, requestUrl) {
+  const pathnameRaw = String(requestUrl.pathname || '').trim();
+  const pathname = pathnameRaw.length > 1 && pathnameRaw.endsWith('/')
+    ? pathnameRaw.slice(0, -1)
+    : pathnameRaw;
+  const loginPath = `${adminDashboardPath}/login`;
+  const logoutPath = `${adminDashboardPath}/logout`;
+  const orderStatusPath = `${adminDashboardPath}/order-status`;
+  const productUpdatePath = `${adminDashboardPath}/product-update`;
+  const productSyncPath = `${adminDashboardPath}/product-sync`;
+  const accountAddPath = `${adminDashboardPath}/account-add`;
+
+  if (
+    pathname !== adminDashboardPath
+    && pathname !== loginPath
+    && pathname !== logoutPath
+    && pathname !== orderStatusPath
+    && pathname !== productUpdatePath
+    && pathname !== productSyncPath
+    && pathname !== accountAddPath
+  ) {
+    return false;
+  }
+
+  if (pathname === loginPath && req.method === 'POST') {
+    const rawBody = await readRawRequestBody(req);
+    const form = parseFormUrlEncoded(rawBody);
+    const key = String(form.key || '').trim();
+
+    if (!adminDashboardKey) {
+      sendHtml(res, 503, renderAdminDashboardLoginPage('Chưa cấu hình ADMIN_DASHBOARD_KEY trong .env'));
+      return true;
+    }
+
+    if (key !== adminDashboardKey) {
+      sendHtml(res, 401, renderAdminDashboardLoginPage('Key đăng nhập không đúng.'));
+      return true;
+    }
+
+    const sessionToken = createAdminDashboardSession();
+    redirectResponse(res, buildAdminDashboardUrl({ tab: 'orders' }), {
+      'Set-Cookie': buildAdminDashboardSessionCookie(sessionToken),
+    });
+    return true;
+  }
+
+  const session = getAdminDashboardSession(req);
+  if (!session) {
+    if (req.method === 'GET' && pathname === adminDashboardPath) {
+      sendHtml(res, 200, renderAdminDashboardLoginPage(!adminDashboardKey ? 'Cần cấu hình ADMIN_DASHBOARD_KEY để bật dashboard.' : ''));
+      return true;
+    }
+    redirectResponse(res, adminDashboardPath, {
+      'Set-Cookie': buildClearAdminDashboardSessionCookie(),
+    });
+    return true;
+  }
+
+  if (pathname === logoutPath && (req.method === 'POST' || req.method === 'GET')) {
+    revokeAdminDashboardSession(req);
+    redirectResponse(res, adminDashboardPath, {
+      'Set-Cookie': buildClearAdminDashboardSessionCookie(),
+    });
+    return true;
+  }
+
+  if (pathname === orderStatusPath && req.method === 'POST') {
+    const rawBody = await readRawRequestBody(req);
+    const form = parseFormUrlEncoded(rawBody);
+    const orderId = String(form.order_id || '').trim();
+    const status = normalizeDashboardOrderStatus(form.status);
+    const statusFilter = normalizeDashboardOrderStatus(form.status_filter);
+    if (!orderId || status === 'all') {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'orders',
+        status_filter: statusFilter,
+        err: 'Thiếu dữ liệu cập nhật trạng thái đơn.',
+      }));
+      return true;
+    }
+
+    try {
+      const result = await updateOrderStatusFromAdmin(orderId, status, null, 'Updated from admin dashboard');
+      if (!result.ok) {
+        const message = result.reason === 'not_found' ? 'Không tìm thấy đơn.' : 'Không thể cập nhật trạng thái.';
+        redirectResponse(res, buildAdminDashboardUrl({
+          tab: 'orders',
+          status_filter: statusFilter,
+          err: message,
+        }));
+        return true;
+      }
+
+      await notifyOrderOwnerStatusChanged(result.order);
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'orders',
+        status_filter: statusFilter,
+        msg: `Đã cập nhật đơn #${orderId} -> ${status}`,
+      }));
+      return true;
+    } catch (error) {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'orders',
+        status_filter: statusFilter,
+        err: `Cập nhật thất bại: ${String(error.message || 'unknown')}`,
+      }));
+      return true;
+    }
+  }
+
+  if (pathname === productUpdatePath && req.method === 'POST') {
+    const rawBody = await readRawRequestBody(req);
+    const form = parseFormUrlEncoded(rawBody);
+    const productId = String(form.product_id || '').trim();
+    const price = parsePositiveMoney(String(form.price || '').trim());
+    const stockQuantity = parseNonNegativeInt(String(form.stock_quantity || '').trim());
+    const isActive = String(form.is_active || '').trim() === '1';
+
+    if (!productId || price === null || stockQuantity === null) {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'products',
+        err: 'Giá hoặc tồn kho không hợp lệ.',
+      }));
+      return true;
+    }
+
+    try {
+      await updateAdminProduct(productId, {
+        price,
+        stock_quantity: stockQuantity,
+        is_active: isActive,
+      });
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'products',
+        msg: 'Đã cập nhật sản phẩm.',
+      }));
+      return true;
+    } catch (error) {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'products',
+        err: `Cập nhật sản phẩm thất bại: ${String(error.message || 'unknown')}`,
+      }));
+      return true;
+    }
+  }
+
+  if (pathname === productSyncPath && req.method === 'POST') {
+    const rawBody = await readRawRequestBody(req);
+    const form = parseFormUrlEncoded(rawBody);
+    const productId = String(form.product_id || '').trim();
+    if (!productId) {
+      redirectResponse(res, buildAdminDashboardUrl({ tab: 'products', err: 'Thiếu product_id để sync kho.' }));
+      return true;
+    }
+
+    try {
+      const synced = await syncProductStockFromAutoAccounts(productId);
+      const targetTab = String(form.tab || '').trim() === 'accounts' ? 'accounts' : 'products';
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: targetTab,
+        product_id: targetTab === 'accounts' ? productId : '',
+        msg: `Đã sync stock: ${Number(synced.stock_quantity || 0)}`,
+      }));
+      return true;
+    } catch (error) {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'products',
+        err: `Sync stock thất bại: ${String(error.message || 'unknown')}`,
+      }));
+      return true;
+    }
+  }
+
+  if (pathname === accountAddPath && req.method === 'POST') {
+    const rawBody = await readRawRequestBody(req);
+    const form = parseFormUrlEncoded(rawBody);
+    const productId = String(form.product_id || '').trim();
+    const accountLines = String(form.account_lines || '').trim();
+
+    if (!productId || !accountLines) {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'accounts',
+        product_id: productId,
+        err: 'Vui lòng nhập dữ liệu account.',
+      }));
+      return true;
+    }
+
+    try {
+      const result = await addProductAccountsBulk(productId, accountLines);
+      const synced = await syncProductStockFromAutoAccounts(productId);
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'accounts',
+        product_id: productId,
+        msg: `Đã thêm ${result.added}/${result.total} dòng, stock=${Number(synced.stock_quantity || 0)}`,
+      }));
+      return true;
+    } catch (error) {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'accounts',
+        product_id: productId,
+        err: `Thêm account thất bại: ${String(error.message || 'unknown')}`,
+      }));
+      return true;
+    }
+  }
+
+  if (pathname !== adminDashboardPath || req.method !== 'GET') {
+    sendJson(res, 404, { ok: false, error: 'Not found' });
+    return true;
+  }
+
+  const tab = normalizeDashboardTab(requestUrl.searchParams.get('tab'));
+  const statusFilter = normalizeDashboardOrderStatus(requestUrl.searchParams.get('status_filter'));
+  const infoMessage = String(requestUrl.searchParams.get('msg') || '').trim();
+  const errorMessage = String(requestUrl.searchParams.get('err') || '').trim();
+  const selectedProductId = String(requestUrl.searchParams.get('product_id') || '').trim();
+
+  try {
+    const products = await loadDashboardProducts();
+    let orders = [];
+    if (tab === 'orders') {
+      orders = await loadDashboardOrders(statusFilter, 120);
+    }
+
+    let selectedProduct = null;
+    let accountSummary = null;
+    if (tab === 'accounts' && selectedProductId) {
+      selectedProduct = await loadProductAny(selectedProductId);
+      if (selectedProduct && usesAccountInventory(selectedProduct)) {
+        accountSummary = await loadAdminProductAccountsSummary(selectedProductId, 60);
+      }
+    }
+
+    const html = renderAdminDashboardPage({
+      tab,
+      statusFilter,
+      infoMessage,
+      errorMessage,
+      orders,
+      products,
+      selectedProductId,
+      selectedProduct,
+      accountSummary,
+    });
+    sendHtml(res, 200, html);
+    return true;
+  } catch (error) {
+    sendHtml(res, 500, renderAdminDashboardPage({
+      tab,
+      statusFilter,
+      infoMessage: '',
+      errorMessage: `Lỗi tải dashboard: ${String(error.message || 'unknown')}`,
+      orders: [],
+      products: [],
+      selectedProductId,
+      selectedProduct: null,
+      accountSummary: null,
+    }));
+    return true;
+  }
 }
 
 async function findOrderByTransferCode(transferCode) {
@@ -1451,39 +2396,41 @@ function startMmobankWebhookServer() {
       return;
     }
 
+    try {
+      const handledByDashboard = await handleAdminDashboardRequest(req, res, requestUrl);
+      if (handledByDashboard) {
+        return;
+      }
+    } catch (error) {
+      console.error('Admin dashboard error:', error);
+      if (!res.headersSent) {
+        sendJson(res, 500, { ok: false, error: 'admin_dashboard_error' });
+      }
+      return;
+    }
+
     if (req.method !== 'POST' || requestUrl.pathname !== mmobankWebhookPath) {
       sendJson(res, 404, { ok: false, error: 'Not found' });
       return;
     }
 
-    let rawBody = '';
-    req.on('data', (chunk) => {
-      rawBody += chunk;
-      if (rawBody.length > 1024 * 1024) {
-        req.destroy();
+    try {
+      const rawBody = await readRawRequestBody(req);
+      await handleMmobankWebhook(req, res, rawBody);
+    } catch (error) {
+      if (String(error?.message || '').includes('payload_too_large')) {
+        sendJson(res, 413, { ok: false, error: 'payload_too_large' });
+        return;
       }
-    });
-
-    req.on('end', async () => {
-      try {
-        await handleMmobankWebhook(req, res, rawBody);
-      } catch (error) {
-        console.error('MMOBank webhook error:', error);
-        if (!res.headersSent) {
-          sendJson(res, 500, { ok: false, error: 'internal_error' });
-        }
-      }
-    });
-
-    req.on('error', () => {
+      console.error('MMOBank webhook error:', error);
       if (!res.headersSent) {
-        sendJson(res, 400, { ok: false, error: 'invalid_request' });
+        sendJson(res, 500, { ok: false, error: 'internal_error' });
       }
-    });
+    }
   });
 
   server.listen(webhookPort, () => {
-    console.log(`Webhook server listening on :${webhookPort}${mmobankWebhookPath}`);
+    console.log(`Webhook server listening on :${webhookPort}${mmobankWebhookPath} | admin: ${adminDashboardPath}`);
   });
 
   return server;
@@ -3234,6 +4181,7 @@ async function processPurchase(ctx, user, locale, product, quantity = 1) {
   }
 
   const order = await createSingleItemOrder(user.id, product, qty);
+  scheduleOrderExpiry(order.id);
   const unitPrice = calcUnitPriceByQuantity(product.price, qty);
   const createdMessage = await ctx.reply(buildOrderCreatedMessage(order, product, qty, unitPrice));
   if (createdMessage?.chat?.id && Number.isInteger(createdMessage.message_id)) {
@@ -3274,7 +4222,6 @@ async function processPurchase(ctx, user, locale, product, quantity = 1) {
     await rememberOrderPaymentMessageRef(order.id, paymentMessage.chat.id, paymentMessage.message_id, 'payment');
   }
 
-  scheduleOrderExpiry(order.id);
   await notifyAdminsNewOrder(order.id, order.total_amount, order.currency || 'VND');
 }
 
@@ -3448,18 +4395,13 @@ function clearPendingAdminInput(ctx) {
 function buildHelpMessage(locale, admin = false) {
   if (admin) {
     return [
-      '📘 ADMIN HELP',
+      '📘 BROADCAST HELP',
       '',
       '/menu - Xem danh sách gói',
       '/orders - Xem đơn hàng',
       '/me - Thông tin tài khoản',
-      '/admin - Mở dashboard admin',
-      '/checkorder <ma_don|ma_ho_tro_DHxxxxxx> - Kiểm tra chi tiết đơn',
-      '/kho <ma_sp> - Xem kho KEY/ACCOUNT của sản phẩm',
-      '/addproduct <ten>|<gia>|<currency>|<loai>|<mo_ta> - loai: key|account|support',
-      '/notify <telegram_id> <noi_dung> - Gửi tin nhắn thủ công',
       '/notifyall <noi_dung> - Gửi thông báo cho toàn bộ user',
-      '/cancel - Hủy thao tác nhập liệu đang chờ',
+      '/help - Trợ giúp',
     ].join('\n');
   }
 
@@ -3497,11 +4439,6 @@ async function registerChatMenuCommands() {
 
   const adminCommands = [
     ...userCommands,
-    { command: 'admin', description: 'Bang dieu khien admin' },
-    { command: 'checkorder', description: 'Kiem tra chi tiet don' },
-    { command: 'kho', description: 'Xem kho key/account' },
-    { command: 'addproduct', description: 'Them san pham nhanh' },
-    { command: 'notify', description: 'Gui thong bao 1 user' },
     { command: 'notifyall', description: 'Gui thong bao tat ca user' },
   ];
 
@@ -3561,7 +4498,7 @@ bot.start(async (ctx) => {
 bot.command('help', async (ctx) => {
   const user = await ensureUser(ctx);
   const locale = getLocale(user);
-  await ctx.reply(buildHelpMessage(locale, isAdmin(ctx, user)));
+  await ctx.reply(buildHelpMessage(locale, canUseNotifyAll(ctx, user)));
 });
 
 bot.command('catalogue', async (ctx) => {
@@ -3663,6 +4600,44 @@ bot.command('admin', async (ctx) => {
   }
 
   await sendAdminMainPanel(ctx);
+});
+
+bot.command('clear', async (ctx) => {
+  const user = await ensureUser(ctx);
+  const locale = getLocale(user);
+  if (!isAdmin(ctx, user)) {
+    await ctx.reply(t(locale, 'noAdmin'));
+    return;
+  }
+
+  const payload = getCommandPayload(ctx.message.text, 'clear');
+  const parsedCount = parseNonNegativeInt(payload);
+  const requested = parsedCount === null ? 30 : parsedCount;
+  const count = Math.min(Math.max(requested, 1), 200);
+
+  const chatId = ctx.chat?.id;
+  const currentMessageId = ctx.message?.message_id;
+  if (!Number.isInteger(chatId) || !Number.isInteger(currentMessageId)) {
+    await ctx.reply('Không thể xác định chat hiện tại để xóa tin.');
+    return;
+  }
+
+  let deleted = 0;
+  let failed = 0;
+  for (let offset = 0; offset < count; offset += 1) {
+    const messageId = currentMessageId - offset;
+    if (messageId <= 0) {
+      break;
+    }
+    try {
+      await bot.telegram.deleteMessage(chatId, messageId);
+      deleted += 1;
+    } catch (error) {
+      failed += 1;
+    }
+  }
+
+  await ctx.reply(`Đã clear xong. Xóa thành công: ${deleted}${failed ? ` | Bỏ qua: ${failed}` : ''}`);
 });
 
 bot.command('checkorder', async (ctx) => {
@@ -3791,36 +4766,8 @@ bot.action('admin_add_product_start', async (ctx) => {
 });
 
 bot.command('claimadmin', async (ctx) => {
-  const parts = ctx.message.text.trim().split(/\s+/);
-  const secret = parts[1] || '';
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-
-  if (!secret) {
-    await ctx.reply('Dùng: /claimadmin <secret_key>');
-    return;
-  }
-
-  if (!isSecretKeyValid(secret)) {
-    await ctx.reply(t(locale, 'invalidKey'));
-    return;
-  }
-
-  const telegramId = String(ctx.from.id);
-  runtimeAdminIds.add(telegramId);
-
-  if (user.role !== 'admin') {
-    const { error } = await db
-      .from('users')
-      .update({ role: 'admin' })
-      .eq('id', user.id);
-
-    if (error) {
-      throw error;
-    }
-  }
-
-  await ctx.reply(t(locale, 'adminGranted'));
+  await ensureUser(ctx);
+  await ctx.reply('Đã tắt tính năng admin trong chat bot. Chỉ còn lệnh /notifyall cho tài khoản được cấu hình.');
 });
 
 async function loadAllKnownUserTelegramIds() {
@@ -3902,7 +4849,7 @@ bot.command('notify', async (ctx) => {
 bot.command('notifyall', async (ctx) => {
   const user = await ensureUser(ctx);
   const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
+  if (!canUseNotifyAll(ctx, user)) {
     await ctx.reply(t(locale, 'noAdmin'));
     return;
   }
@@ -4223,15 +5170,10 @@ bot.action(/^paycancel:(.+)$/, async (ctx) => {
     }
 
     await safeAnswerCbQuery(ctx, result.alreadyCancelled ? 'Đã hủy trước đó' : 'Đã hủy đơn');
-    const clearKeyboard = { reply_markup: { inline_keyboard: [] } };
-    const text = locale === 'en'
-      ? `Order #${orderId} has been cancelled.`
-      : `Đơn #${orderId} đã được hủy.`;
-
-    if (ctx.callbackQuery?.message?.photo) {
-      await replaceCaptionOrReply(ctx, text, clearKeyboard);
-    } else {
-      await replaceOrReply(ctx, text, clearKeyboard);
+    try {
+      await ctx.deleteMessage();
+    } catch (deleteError) {
+      // no-op: can already be deleted by clearOrderPaymentMessages
     }
   } catch (error) {
     console.error('paycancel handler failed:', error);
@@ -4292,52 +5234,18 @@ bot.action(/^ordst:(.+):(draft|confirmed|paid|cancelled)$/, async (ctx) => {
 
   const orderId = ctx.match[1];
   const status = ctx.match[2];
-
-  const { data: updated, error } = await db
-    .from('orders')
-    .update({ status })
-    .eq('id', orderId)
-    .select('id,user_id,status,total_amount,currency')
-    .single();
-
-  if (error) {
-    throw error;
-  }
-
-  await db.from('order_history').insert({
-    order_id: updated.id,
-    changed_by: user.id,
-    status,
-    comment: 'Updated from admin panel',
-  });
-
-  if (status === 'paid') {
-    clearOrderExpiryTimer(updated.id);
-    await deliverAutoAccountsAfterPaid(updated);
-    await clearOrderPaymentMessages(updated.id);
-  } else if (status === 'cancelled') {
-    clearOrderExpiryTimer(updated.id);
-    await clearOrderPaymentMessages(updated.id);
-  } else {
-    scheduleOrderExpiry(updated.id);
-  }
-
-  const { data: owner } = await db
-    .from('users')
-    .select('telegram_id')
-    .eq('id', updated.user_id)
-    .maybeSingle();
-
-  if (owner?.telegram_id) {
-    try {
-      await bot.telegram.sendMessage(
-        Number(owner.telegram_id),
-        `Đơn #${updated.id} của bạn đã được cập nhật: ${updated.status}`,
-      );
-    } catch (errorNotify) {
-      // no-op
+  const result = await updateOrderStatusFromAdmin(orderId, status, user.id, 'Updated from admin panel');
+  if (!result.ok) {
+    if (result.reason === 'not_found') {
+      await ctx.answerCbQuery('Không tìm thấy đơn', { show_alert: true });
+      return;
     }
+    await ctx.answerCbQuery('Không thể cập nhật trạng thái', { show_alert: true });
+    return;
   }
+  const updated = result.order;
+
+  await notifyOrderOwnerStatusChanged(updated);
 
   await ctx.answerCbQuery('Updated');
   await replaceOrReply(
@@ -5015,9 +5923,11 @@ const webhookServer = startMmobankWebhookServer();
 bot.launch().then(async () => {
   await registerChatMenuCommands();
   await restorePendingOrderExpirySchedules();
+  startOrderExpirySweeper();
   console.log('Bot launched.');
 }).catch((err) => {
   console.error('Failed to launch bot', err);
+  stopOrderExpirySweeper();
   try {
     webhookServer.close();
   } catch (error) {
@@ -5027,6 +5937,7 @@ bot.launch().then(async () => {
 });
 
 process.once('SIGINT', () => {
+  stopOrderExpirySweeper();
   try {
     webhookServer.close();
   } catch (error) {
@@ -5036,6 +5947,7 @@ process.once('SIGINT', () => {
 });
 
 process.once('SIGTERM', () => {
+  stopOrderExpirySweeper();
   try {
     webhookServer.close();
   } catch (error) {

@@ -18,6 +18,9 @@ Optional:
 - `MMOBANK_SECRET_KEY`
 - `MMOBANK_BANK_CODE`
 - `MMOBANK_ACCOUNT_NAME`
+- `ADMIN_DASHBOARD_KEY` (default fallback: `ADMIN_SECRET_KEY`)
+- `ADMIN_DASHBOARD_PATH` (default: `/admin`)
+- `ADMIN_DASHBOARD_SESSION_TTL_SECONDS` (default: `43200`)
 
 ## Database setup
 1. Open your PostgreSQL SQL console/tool.
@@ -43,8 +46,21 @@ Optional:
    - `MMOBANK_SECRET_KEY` (optional)
    - `MMOBANK_BANK_CODE` (optional)
    - `MMOBANK_ACCOUNT_NAME` (optional)
+   - `PAYMENT_TIMEOUT_SECONDS` (optional, default `60`)
+   - `ORDER_EXPIRY_SWEEP_INTERVAL_MS` (optional, default `15000`, min `5000`)
+   - `ADMIN_DASHBOARD_KEY` (optional but recommended for dashboard)
+   - `ADMIN_DASHBOARD_PATH` (optional, default `/admin`)
+   - `ADMIN_DASHBOARD_SESSION_TTL_SECONDS` (optional, default `43200`)
 4. Start command: `npm start` (already in `railway.json`).
 5. Redeploy and check logs for `Bot launched.`
+
+## Admin dashboard (web)
+- URL mặc định: `/admin` (có thể đổi bằng `ADMIN_DASHBOARD_PATH`)
+- Đăng nhập bằng `ADMIN_DASHBOARD_KEY` (hoặc fallback `ADMIN_SECRET_KEY`)
+- Chức năng v1:
+  - Quản lý đơn hàng (đổi trạng thái trực tiếp)
+  - Quản lý sản phẩm (sửa giá/tồn/bật tắt)
+  - Quản lý kho account (xem preview, thêm account, sync tồn kho)
 
 ## MMOBank webhook setup
 1. Deploy bot, then get your public app URL from Railway.
