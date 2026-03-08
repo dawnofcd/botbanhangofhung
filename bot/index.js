@@ -267,8 +267,16 @@ async function expireUnpaidOrder(orderId) {
     return;
   }
 
+  let releasedAccountProducts = [];
   try {
-    await restoreStockFromOrderItems(updated.id);
+    const released = await releaseReservedAccountsForOrder(updated.id);
+    releasedAccountProducts = released.productIds || [];
+  } catch (error) {
+    console.error('releaseReservedAccountsForOrder failed (timeout):', error);
+  }
+
+  try {
+    await restoreStockFromOrderItems(updated.id, { skipProductIds: releasedAccountProducts });
   } catch (error) {
     console.error('restoreStockFromOrderItems failed (timeout):', error);
   }
@@ -959,6 +967,60 @@ async function addProductAccountsBulk(productId, accountLines) {
   };
 }
 
+async function adjustProductStockWithRetry(productId, delta, maxRetries = 6) {
+  const targetProductId = String(productId || '').trim();
+  const targetDelta = Number(delta || 0);
+  if (!targetProductId) {
+    throw new Error('product_id_missing');
+  }
+  if (!Number.isFinite(targetDelta) || targetDelta === 0) {
+    return { ok: true, stockQuantity: null };
+  }
+
+  const retries = Number.isFinite(Number(maxRetries))
+    ? Math.max(1, Math.round(Number(maxRetries)))
+    : 6;
+
+  for (let attempt = 0; attempt < retries; attempt += 1) {
+    const { data: currentProduct, error: productError } = await db
+      .from('products')
+      .select('id,stock_quantity')
+      .eq('id', targetProductId)
+      .maybeSingle();
+    if (productError) {
+      throw productError;
+    }
+    if (!currentProduct) {
+      return { ok: false, reason: 'product_not_found' };
+    }
+
+    const currentStock = Number(currentProduct.stock_quantity || 0);
+    const nextStock = currentStock + targetDelta;
+    if (nextStock < 0) {
+      return { ok: false, reason: 'insufficient_stock', currentStock };
+    }
+
+    const { data: updatedProduct, error: updateError } = await db
+      .from('products')
+      .update({ stock_quantity: nextStock })
+      .eq('id', targetProductId)
+      .eq('stock_quantity', currentStock)
+      .select('id,stock_quantity')
+      .maybeSingle();
+    if (updateError) {
+      throw updateError;
+    }
+    if (updatedProduct) {
+      return {
+        ok: true,
+        stockQuantity: Number(updatedProduct.stock_quantity || 0),
+      };
+    }
+  }
+
+  return { ok: false, reason: 'stock_update_conflict' };
+}
+
 async function syncProductStockFromAutoAccounts(productId) {
   const { count, error: countError } = await db
     .from('product_accounts')
@@ -983,6 +1045,46 @@ async function syncProductStockFromAutoAccounts(productId) {
   }
 
   return data || { id: productId, stock_quantity: stock };
+}
+
+async function releaseReservedAccountsForOrder(orderId) {
+  const oid = String(orderId || '').trim();
+  if (!oid) {
+    return { released: 0, productIds: [] };
+  }
+
+  const { data: rows, error: rowsError } = await db
+    .from('product_accounts')
+    .select('id,product_id')
+    .eq('used_order_id', oid)
+    .limit(5000);
+  if (rowsError) {
+    throw rowsError;
+  }
+
+  const targetRows = rows || [];
+  if (!targetRows.length) {
+    return { released: 0, productIds: [] };
+  }
+
+  const { error: releaseError } = await db
+    .from('product_accounts')
+    .update({ is_used: false, used_order_id: null, used_at: null })
+    .eq('used_order_id', oid);
+  if (releaseError) {
+    throw releaseError;
+  }
+
+  const productIds = [...new Set(targetRows.map((row) => String(row.product_id || '').trim()).filter(Boolean))];
+  for (const productId of productIds) {
+    try {
+      await syncProductStockFromAutoAccounts(productId);
+    } catch (error) {
+      console.error('syncProductStockFromAutoAccounts failed (release):', error);
+    }
+  }
+
+  return { released: targetRows.length, productIds };
 }
 
 async function claimAutoAccount(productId, orderId) {
@@ -1046,39 +1148,79 @@ async function createSingleItemOrder(userId, product, quantity = 1) {
     throw orderError;
   }
 
-  const { error: itemError } = await db
-    .from('order_items')
-    .insert({
+  const accountInventory = usesAccountInventory(product);
+  let stockReserved = false;
+  try {
+    if (accountInventory) {
+      const reservedRows = [];
+      for (let i = 0; i < qty; i += 1) {
+        const claimed = await claimAutoAccount(product.id, order.id);
+        if (!claimed) {
+          break;
+        }
+        reservedRows.push(claimed);
+      }
+
+      if (reservedRows.length < qty) {
+        await releaseReservedAccountsForOrder(order.id);
+        throw new Error('out_of_stock');
+      }
+      await syncProductStockFromAutoAccounts(product.id);
+    } else {
+      const reserveResult = await adjustProductStockWithRetry(product.id, -qty);
+      if (!reserveResult.ok) {
+        throw new Error('out_of_stock');
+      }
+      stockReserved = true;
+    }
+
+    const { error: itemError } = await db
+      .from('order_items')
+      .insert({
+        order_id: order.id,
+        product_id: product.id,
+        unit_price: unitPrice,
+        quantity: qty,
+        total_price: total,
+      });
+
+    if (itemError) {
+      throw itemError;
+    }
+
+    await db.from('order_history').insert({
       order_id: order.id,
-      product_id: product.id,
-      unit_price: unitPrice,
-      quantity: qty,
-      total_price: total,
+      changed_by: userId,
+      status: 'confirmed',
+      comment: 'Order created from Telegram bot',
     });
 
-  if (itemError) {
-    throw itemError;
-  }
-
-  if (typeof product.stock_quantity === 'number') {
-    const { error: stockError } = await db
-      .from('products')
-      .update({ stock_quantity: Math.max(product.stock_quantity - qty, 0) })
-      .eq('id', product.id);
-
-    if (stockError) {
-      throw stockError;
+    return order;
+  } catch (error) {
+    try {
+      if (accountInventory) {
+        await releaseReservedAccountsForOrder(order.id);
+      } else if (stockReserved) {
+        await adjustProductStockWithRetry(product.id, qty);
+      }
+    } catch (rollbackError) {
+      console.error('createSingleItemOrder rollback inventory failed:', rollbackError);
     }
+
+    try {
+      await db.from('order_items').delete().eq('order_id', order.id);
+    } catch (cleanupItemsError) {
+      console.error('createSingleItemOrder cleanup order_items failed:', cleanupItemsError);
+    }
+
+    try {
+      await db.from('orders').delete().eq('id', order.id);
+    } catch (cleanupOrderError) {
+      console.error('createSingleItemOrder cleanup order failed:', cleanupOrderError);
+    }
+
+    throw error;
   }
-
-  await db.from('order_history').insert({
-    order_id: order.id,
-    changed_by: userId,
-    status: 'confirmed',
-    comment: 'Order created from Telegram bot',
-  });
-
-  return order;
 }
 
 async function notifyAdminsNewOrder(orderId, total, currency) {
@@ -1097,7 +1239,13 @@ async function notifyAdminsNewOrder(orderId, total, currency) {
   }
 }
 
-async function restoreStockFromOrderItems(orderId) {
+async function restoreStockFromOrderItems(orderId, options = {}) {
+  const skipProductIds = new Set(
+    [...(options?.skipProductIds || [])]
+      .map((id) => String(id || '').trim())
+      .filter(Boolean),
+  );
+
   const { data: items, error: itemsError } = await db
     .from('order_items')
     .select('product_id,quantity')
@@ -1117,6 +1265,10 @@ async function restoreStockFromOrderItems(orderId) {
   }
 
   for (const [productId, quantity] of grouped.entries()) {
+    if (skipProductIds.has(String(productId || '').trim())) {
+      continue;
+    }
+
     const { data: product, error: productError } = await db
       .from('products')
       .select('id,stock_quantity')
@@ -1129,14 +1281,9 @@ async function restoreStockFromOrderItems(orderId) {
       continue;
     }
 
-    const currentStock = Number(product.stock_quantity || 0);
-    const nextStock = Math.max(currentStock + quantity, 0);
-    const { error: updateError } = await db
-      .from('products')
-      .update({ stock_quantity: nextStock })
-      .eq('id', productId);
-    if (updateError) {
-      throw updateError;
+    const restoreResult = await adjustProductStockWithRetry(productId, quantity);
+    if (!restoreResult.ok && restoreResult.reason !== 'product_not_found') {
+      throw new Error(`stock_restore_failed:${restoreResult.reason}`);
     }
   }
 }
@@ -1179,8 +1326,16 @@ async function cancelOrderByUser(orderId, userId) {
     return { ok: false, reason: 'status_changed' };
   }
 
+  let releasedAccountProducts = [];
   try {
-    await restoreStockFromOrderItems(orderId);
+    const released = await releaseReservedAccountsForOrder(orderId);
+    releasedAccountProducts = released.productIds || [];
+  } catch (error) {
+    console.error('releaseReservedAccountsForOrder failed:', error);
+  }
+
+  try {
+    await restoreStockFromOrderItems(orderId, { skipProductIds: releasedAccountProducts });
   } catch (error) {
     console.error('restoreStockFromOrderItems failed:', error);
   }
@@ -1245,8 +1400,16 @@ async function updateOrderStatusFromAdmin(orderId, status, changedByUserId = nul
   } else if (targetStatus === 'cancelled') {
     clearOrderExpiryTimer(updated.id);
     if (['draft', 'confirmed'].includes(previousStatus)) {
+      let releasedAccountProducts = [];
       try {
-        await restoreStockFromOrderItems(updated.id);
+        const released = await releaseReservedAccountsForOrder(updated.id);
+        releasedAccountProducts = released.productIds || [];
+      } catch (releaseError) {
+        console.error('releaseReservedAccountsForOrder failed (admin cancel):', releaseError);
+      }
+
+      try {
+        await restoreStockFromOrderItems(updated.id, { skipProductIds: releasedAccountProducts });
       } catch (restoreError) {
         console.error('restoreStockFromOrderItems failed (admin cancel):', restoreError);
       }
@@ -1449,6 +1612,25 @@ function normalizeDashboardOrderStatus(rawStatus) {
   return 'all';
 }
 
+function normalizeDashboardProductScope(rawScope) {
+  const scope = String(rawScope || '').trim().toLowerCase();
+  if (scope === 'all') {
+    return 'all';
+  }
+  return 'active';
+}
+
+function normalizeDashboardAccountScope(rawScope) {
+  const scope = String(rawScope || '').trim().toLowerCase();
+  if (scope === 'all') {
+    return 'all';
+  }
+  if (scope === 'used') {
+    return 'used';
+  }
+  return 'use';
+}
+
 function buildAdminDashboardUrl(params = {}) {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
@@ -1494,13 +1676,19 @@ async function loadDashboardOrders(statusFilter = 'all', limit = 80) {
   }));
 }
 
-async function loadDashboardProducts(limit = 120) {
+async function loadDashboardProducts(limit = 120, scope = 'active') {
   const maxRows = Number.isFinite(Number(limit)) ? Math.max(1, Math.round(Number(limit))) : 120;
-  const { data, error } = await db
+  const safeScope = normalizeDashboardProductScope(scope);
+  const query = db
     .from('products')
     .select('id,name,price,currency,stock_quantity,is_active,delivery_type,updated_at')
     .order('updated_at', { ascending: false })
     .limit(maxRows);
+  if (safeScope === 'active') {
+    query.eq('is_active', true);
+  }
+
+  const { data, error } = await query;
 
   if (error) {
     throw error;
@@ -1560,6 +1748,8 @@ function renderAdminDashboardLoginPage(errorText = '') {
 function renderAdminDashboardPage({
   tab = 'orders',
   statusFilter = 'all',
+  productScope = 'active',
+  accountScope = 'use',
   infoMessage = '',
   errorMessage = '',
   orders = [],
@@ -1570,6 +1760,8 @@ function renderAdminDashboardPage({
 }) {
   const safeTab = normalizeDashboardTab(tab);
   const safeStatusFilter = normalizeDashboardOrderStatus(statusFilter);
+  const safeProductScope = normalizeDashboardProductScope(productScope);
+  const safeAccountScope = normalizeDashboardAccountScope(accountScope);
   const orderStatusOptions = ['all', 'draft', 'confirmed', 'paid', 'cancelled'];
   const statusMeta = {
     all: { label: 'Tất cả', className: 'neutral' },
@@ -1599,9 +1791,9 @@ function renderAdminDashboardPage({
   ).trim();
 
   const nav = [
-    `<a class="${navOrdersClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'orders', status_filter: safeStatusFilter }))}">Đơn hàng</a>`,
-    `<a class="${navProductsClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'products' }))}">Sản phẩm</a>`,
-    `<a class="${navAccountsClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'accounts', product_id: effectiveSelectedProductId }))}">Kho account</a>`,
+    `<a class="${navOrdersClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'orders', status_filter: safeStatusFilter, products_scope: safeProductScope }))}">Đơn hàng</a>`,
+    `<a class="${navProductsClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'products', products_scope: safeProductScope }))}">Sản phẩm</a>`,
+    `<a class="${navAccountsClass}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'accounts', product_id: effectiveSelectedProductId, products_scope: safeProductScope, account_scope: safeAccountScope }))}">Kho account</a>`,
   ].join('');
 
   const orderStats = {
@@ -1647,8 +1839,12 @@ function renderAdminDashboardPage({
 
   const quickFilterLinks = orderStatusOptions.map((status) => {
     const active = safeStatusFilter === status ? 'chip active' : 'chip';
-    return `<a class="${active}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'orders', status_filter: status }))}">${escapeHtml(statusMeta[status]?.label || status)}</a>`;
+    return `<a class="${active}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'orders', status_filter: status, products_scope: safeProductScope }))}">${escapeHtml(statusMeta[status]?.label || status)}</a>`;
   }).join('');
+  const productScopeLinks = [
+    `<a class="${safeProductScope === 'active' ? 'chip active' : 'chip'}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'products', products_scope: 'active' }))}">Đang bật</a>`,
+    `<a class="${safeProductScope === 'all' ? 'chip active' : 'chip'}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'products', products_scope: 'all' }))}">Tất cả</a>`,
+  ].join('');
 
   const orderRows = orders.map((order) => {
     const buyer = formatBuyerLabel(order);
@@ -1665,6 +1861,7 @@ function renderAdminDashboardPage({
         `  <input type="hidden" name="order_id" value="${escapeHtml(order.id)}" />`,
         `  <input type="hidden" name="status" value="${escapeHtml(actionStatus)}" />`,
         `  <input type="hidden" name="status_filter" value="${escapeHtml(safeStatusFilter)}" />`,
+        `  <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
         `  <button class="btn-small btn-action ${escapeHtml(meta.className)}" type="submit">${escapeHtml(meta.label)}</button>`,
         '</form>',
       ].join('\n');
@@ -1695,6 +1892,7 @@ function renderAdminDashboardPage({
     '    </div>',
     `    <form method="get" action="${escapeHtml(adminDashboardPath)}" class="inline-form">`,
     '      <input type="hidden" name="tab" value="orders" />',
+    `      <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
     `      <label>Lọc trạng thái <select name="status_filter">${statusFilterOptions}</select></label>`,
     '      <button type="submit">Lọc</button>',
     '    </form>',
@@ -1719,16 +1917,18 @@ function renderAdminDashboardPage({
       ? [
         `<form method="post" action="${escapeHtml(`${adminDashboardPath}/product-sync`)}">`,
         `  <input type="hidden" name="product_id" value="${escapeHtml(product.id)}" />`,
+        `  <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
         '  <button class="btn-small btn-action btn-neutral" type="submit">Sync kho</button>',
         '</form>',
       ].join('\n')
       : '';
     const accountLink = usingAccounts
-      ? `<a class="btn-small link-like" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'accounts', product_id: product.id }))}">Mở kho</a>`
+      ? `<a class="btn-small link-like" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'accounts', product_id: product.id, products_scope: safeProductScope, account_scope: safeAccountScope }))}">Mở kho</a>`
       : '';
     const deleteForm = [
       `<form method="post" action="${escapeHtml(`${adminDashboardPath}/product-delete`)}">`,
       `  <input type="hidden" name="product_id" value="${escapeHtml(product.id)}" />`,
+      `  <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
       '  <button class="btn-small btn-action btn-cancel" type="submit">Xóa / Ẩn</button>',
       '</form>',
     ].join('\n');
@@ -1742,6 +1942,7 @@ function renderAdminDashboardPage({
       '  <td>',
       `    <form class="inline-form product-form" method="post" action="${escapeHtml(`${adminDashboardPath}/product-update`)}">`,
       `      <input type="hidden" name="product_id" value="${escapeHtml(product.id)}" />`,
+      `      <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
       `      <label>Giá <input type="number" name="price" min="0" step="1" value="${escapeHtml(Math.round(Number(product.price || 0)))}" /></label>`,
       `      <label>Tồn <input type="number" name="stock_quantity" min="0" step="1" value="${escapeHtml(stockValue)}" /></label>`,
       `      <span class="${stockBadgeClass}">${escapeHtml(`Stock ${stockValue}`)}</span>`,
@@ -1757,6 +1958,7 @@ function renderAdminDashboardPage({
 
   const createProductForm = [
     `<form class="create-form" method="post" action="${escapeHtml(`${adminDashboardPath}/product-create`)}">`,
+    `  <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
     '  <label>Tên sản phẩm <input name="name" type="text" placeholder="Ví dụ: Netflix Premium 1 tháng" required /></label>',
     '  <label>Giá <input name="price" type="number" min="0" step="1" value="0" required /></label>',
     '  <label>Tiền tệ <input name="currency" type="text" value="VND" maxlength="8" /></label>',
@@ -1780,6 +1982,7 @@ function renderAdminDashboardPage({
       '      <p class="panel-subtitle">Sửa nhanh giá, tồn kho, trạng thái bán và đồng bộ kho key/account.</p>',
     '    </div>',
     '  </div>',
+    `  <div class="chips">${productScopeLinks}</div>`,
     `  ${createProductForm}`,
     '  <div class="table-wrap">',
     '    <table>',
@@ -1794,6 +1997,16 @@ function renderAdminDashboardPage({
     const selected = String(product.id) === String(effectiveSelectedProductId) ? 'selected' : '';
     return `<option value="${escapeHtml(product.id)}" ${selected}>${escapeHtml(product.name || product.id)}</option>`;
   }).join('');
+  const accountScopeLinks = [
+    `<a class="${safeAccountScope === 'use' ? 'chip active' : 'chip'}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'accounts', product_id: effectiveSelectedProductId, products_scope: safeProductScope, account_scope: 'use' }))}">Use</a>`,
+    `<a class="${safeAccountScope === 'used' ? 'chip active' : 'chip'}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'accounts', product_id: effectiveSelectedProductId, products_scope: safeProductScope, account_scope: 'used' }))}">Used</a>`,
+    `<a class="${safeAccountScope === 'all' ? 'chip active' : 'chip'}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'accounts', product_id: effectiveSelectedProductId, products_scope: safeProductScope, account_scope: 'all' }))}">All</a>`,
+  ].join('');
+  const accountScopeLabel = safeAccountScope === 'used'
+    ? 'Used'
+    : safeAccountScope === 'all'
+      ? 'All'
+      : 'Use';
 
   let accountPanel = [
     '<section class="panel">',
@@ -1804,10 +2017,13 @@ function renderAdminDashboardPage({
     '    </div>',
     `    <form class="inline-form" method="get" action="${escapeHtml(adminDashboardPath)}">`,
     '      <input type="hidden" name="tab" value="accounts" />',
+    `      <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
+    `      <input type="hidden" name="account_scope" value="${escapeHtml(safeAccountScope)}" />`,
     `      <select name="product_id">${accountOptions || '<option value="">(không có sản phẩm KEY/ACCOUNT)</option>'}</select>`,
     '      <button type="submit">Xem</button>',
     '    </form>',
     '  </div>',
+    `  <div class="chips">${accountScopeLinks}</div>`,
   ].join('\n');
 
   if (selectedProduct && accountSummary) {
@@ -1820,9 +2036,21 @@ function renderAdminDashboardPage({
       const stateForm = [
         `<form method="post" action="${escapeHtml(`${adminDashboardPath}/account-state`)}">`,
         `  <input type="hidden" name="product_id" value="${escapeHtml(selectedProduct.id)}" />`,
+        `  <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
+        `  <input type="hidden" name="account_scope" value="${escapeHtml(safeAccountScope)}" />`,
         `  <input type="hidden" name="account_id" value="${escapeHtml(row.id)}" />`,
         `  <input type="hidden" name="target" value="${row.is_used ? '0' : '1'}" />`,
         `  <button class="btn-small btn-action ${row.is_used ? 'btn-neutral' : 'btn-paid'}" type="submit">${row.is_used ? 'Unuse' : 'Use'}</button>`,
+        '</form>',
+      ].join('\n');
+      const editForm = [
+        `<form method="post" action="${escapeHtml(`${adminDashboardPath}/account-update`)}">`,
+        `  <input type="hidden" name="product_id" value="${escapeHtml(selectedProduct.id)}" />`,
+        `  <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
+        `  <input type="hidden" name="account_scope" value="${escapeHtml(safeAccountScope)}" />`,
+        `  <input type="hidden" name="account_id" value="${escapeHtml(row.id)}" />`,
+        `  <input class="edit-account-input" type="text" name="account_data" value="${escapeHtml(String(row.account_data || ''))}" />`,
+        '  <button class="btn-small btn-action btn-neutral" type="submit">Sửa</button>',
         '</form>',
       ].join('\n');
       const deleteForm = row.is_used
@@ -1830,6 +2058,8 @@ function renderAdminDashboardPage({
         : [
           `<form method="post" action="${escapeHtml(`${adminDashboardPath}/account-delete`)}">`,
           `  <input type="hidden" name="product_id" value="${escapeHtml(selectedProduct.id)}" />`,
+          `  <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
+          `  <input type="hidden" name="account_scope" value="${escapeHtml(safeAccountScope)}" />`,
           `  <input type="hidden" name="account_id" value="${escapeHtml(row.id)}" />`,
           '  <button class="btn-small btn-action btn-cancel" type="submit">Xóa</button>',
           '</form>',
@@ -1842,25 +2072,29 @@ function renderAdminDashboardPage({
         `  <td>${escapeHtml(parsed.twofa)}</td>`,
         `  <td>${statusBadge}</td>`,
         `  <td>${orderCell}</td>`,
-        `  <td class="actions">${stateForm}${deleteForm}</td>`,
-        '</tr>',
-      ].join('\n');
-    }).join('\n');
+        `  <td class="actions">${stateForm}${editForm}${deleteForm}</td>`,
+      '</tr>',
+    ].join('\n');
+  }).join('\n');
 
     accountPanel += [
       '  <div class="account-summary">',
-      `    <div class="tagline"><strong>${escapeHtml(selectedProduct.name)}</strong><span class="tag">Stock products: ${escapeHtml(String(Number(selectedProduct.stock_quantity || 0)))}</span></div>`,
+      `    <div class="tagline"><strong>${escapeHtml(selectedProduct.name)}</strong><span class="tag">Stock products: ${escapeHtml(String(Number(selectedProduct.stock_quantity || 0)))}</span><span class="tag">Tab: ${escapeHtml(accountScopeLabel)}</span></div>`,
       `    <span class="status-badge paid">Available: ${escapeHtml(String(accountSummary.available))}</span>`,
       `    <span class="status-badge cancelled">Used: ${escapeHtml(String(accountSummary.used))}</span>`,
       '  </div>',
       `  <form class="account-form" method="post" action="${escapeHtml(`${adminDashboardPath}/account-add`)}">`,
       `    <input type="hidden" name="product_id" value="${escapeHtml(selectedProduct.id)}" />`,
+      `    <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
+      `    <input type="hidden" name="account_scope" value="${escapeHtml(safeAccountScope)}" />`,
       '    <textarea name="account_lines" rows="8" placeholder="Mỗi dòng 1 account. Ví dụ: email@gmail.com|MatKhau|2FA"></textarea>',
       '    <button type="submit">Thêm vào kho</button>',
       '  </form>',
       `  <form class="inline-form" method="post" action="${escapeHtml(`${adminDashboardPath}/product-sync`)}">`,
       `    <input type="hidden" name="product_id" value="${escapeHtml(selectedProduct.id)}" />`,
       '    <input type="hidden" name="tab" value="accounts" />',
+      `    <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
+      `    <input type="hidden" name="account_scope" value="${escapeHtml(safeAccountScope)}" />`,
       '    <button class="btn-small btn-action btn-neutral" type="submit">Sync stock từ kho account</button>',
       '  </form>',
       '  <div class="table-wrap">',
@@ -1948,7 +2182,8 @@ function renderAdminDashboardPage({
     '    .create-form label { display: grid; gap: 4px; font-size: 12px; color: #475467; }',
     '    .create-form button { height: 38px; white-space: nowrap; }',
     '    .product-form label { display: inline-flex; align-items: center; gap: 6px; color: #475467; font-size: 12px; }',
-    '    input[type="number"], select, textarea { border: 1px solid #cdd9e5; border-radius: 10px; padding: 7px 9px; font-size: 13px; color: var(--text); background: #fff; }',
+    '    .edit-account-input { min-width: 260px; max-width: 420px; width: min(44vw, 420px); }',
+    '    input[type="number"], input[type="text"], select, textarea { border: 1px solid #cdd9e5; border-radius: 10px; padding: 7px 9px; font-size: 13px; color: var(--text); background: #fff; }',
     '    textarea { width: 100%; min-height: 170px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }',
     '    input:focus, select:focus, textarea:focus { outline: 2px solid #b5ded8; outline-offset: 1px; border-color: #8bcfc6; }',
     '    button, .link-like { border: none; border-radius: 10px; background: var(--brand); color: #fff; padding: 8px 10px; font-weight: 600; font-size: 13px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; transition: transform .08s ease, filter .15s ease; }',
@@ -2003,6 +2238,7 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
   const productDeletePath = `${adminDashboardPath}/product-delete`;
   const productSyncPath = `${adminDashboardPath}/product-sync`;
   const accountAddPath = `${adminDashboardPath}/account-add`;
+  const accountUpdatePath = `${adminDashboardPath}/account-update`;
   const accountDeletePath = `${adminDashboardPath}/account-delete`;
   const accountStatePath = `${adminDashboardPath}/account-state`;
 
@@ -2016,6 +2252,7 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
     && pathname !== productDeletePath
     && pathname !== productSyncPath
     && pathname !== accountAddPath
+    && pathname !== accountUpdatePath
     && pathname !== accountDeletePath
     && pathname !== accountStatePath
   ) {
@@ -2070,10 +2307,12 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
     const orderId = String(form.order_id || '').trim();
     const status = normalizeDashboardOrderStatus(form.status);
     const statusFilter = normalizeDashboardOrderStatus(form.status_filter);
+    const productScope = normalizeDashboardProductScope(form.products_scope);
     if (!orderId || status === 'all') {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'orders',
         status_filter: statusFilter,
+        products_scope: productScope,
         err: 'Thiếu dữ liệu cập nhật trạng thái đơn.',
       }));
       return true;
@@ -2086,6 +2325,7 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
         redirectResponse(res, buildAdminDashboardUrl({
           tab: 'orders',
           status_filter: statusFilter,
+          products_scope: productScope,
           err: message,
         }));
         return true;
@@ -2095,6 +2335,7 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'orders',
         status_filter: statusFilter,
+        products_scope: productScope,
         msg: `Đã cập nhật đơn #${orderId} -> ${status}`,
       }));
       return true;
@@ -2102,6 +2343,7 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'orders',
         status_filter: statusFilter,
+        products_scope: productScope,
         err: `Cập nhật thất bại: ${String(error.message || 'unknown')}`,
       }));
       return true;
@@ -2111,6 +2353,7 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
   if (pathname === productCreatePath && req.method === 'POST') {
     const rawBody = await readRawRequestBody(req);
     const form = parseFormUrlEncoded(rawBody);
+    const productScope = normalizeDashboardProductScope(form.products_scope);
     const name = String(form.name || '').trim();
     const price = parsePositiveMoney(String(form.price || '').trim());
     const currency = String(form.currency || 'VND').trim().toUpperCase() || 'VND';
@@ -2119,6 +2362,7 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
     if (!name || price === null || !productKind) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'products',
+        products_scope: productScope,
         err: 'Dữ liệu tạo sản phẩm chưa hợp lệ.',
       }));
       return true;
@@ -2135,12 +2379,14 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       });
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'products',
+        products_scope: productScope,
         msg: `Đã tạo sản phẩm: ${created.name}`,
       }));
       return true;
     } catch (error) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'products',
+        products_scope: productScope,
         err: `Tạo sản phẩm thất bại: ${String(error.message || 'unknown')}`,
       }));
       return true;
@@ -2150,6 +2396,7 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
   if (pathname === productUpdatePath && req.method === 'POST') {
     const rawBody = await readRawRequestBody(req);
     const form = parseFormUrlEncoded(rawBody);
+    const productScope = normalizeDashboardProductScope(form.products_scope);
     const productId = String(form.product_id || '').trim();
     const price = parsePositiveMoney(String(form.price || '').trim());
     const stockQuantity = parseNonNegativeInt(String(form.stock_quantity || '').trim());
@@ -2158,6 +2405,7 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
     if (!productId || price === null || stockQuantity === null) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'products',
+        products_scope: productScope,
         err: 'Giá hoặc tồn kho không hợp lệ.',
       }));
       return true;
@@ -2171,12 +2419,14 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       });
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'products',
+        products_scope: productScope,
         msg: 'Đã cập nhật sản phẩm.',
       }));
       return true;
     } catch (error) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'products',
+        products_scope: productScope,
         err: `Cập nhật sản phẩm thất bại: ${String(error.message || 'unknown')}`,
       }));
       return true;
@@ -2186,10 +2436,12 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
   if (pathname === productDeletePath && req.method === 'POST') {
     const rawBody = await readRawRequestBody(req);
     const form = parseFormUrlEncoded(rawBody);
+    const productScope = normalizeDashboardProductScope(form.products_scope);
     const productId = String(form.product_id || '').trim();
     if (!productId) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'products',
+        products_scope: productScope,
         err: 'Thiếu product_id để xóa sản phẩm.',
       }));
       return true;
@@ -2200,11 +2452,13 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       if (result.mode === 'soft_hidden') {
         redirectResponse(res, buildAdminDashboardUrl({
           tab: 'products',
+          products_scope: productScope,
           msg: `SP có ${result.linkedOrderItems} dòng đơn, đã chuyển tạm ẩn thay vì xóa cứng.`,
         }));
       } else {
         redirectResponse(res, buildAdminDashboardUrl({
           tab: 'products',
+          products_scope: productScope,
           msg: 'Đã xóa sản phẩm.',
         }));
       }
@@ -2214,11 +2468,13 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
         await updateAdminProduct(productId, { is_active: false });
         redirectResponse(res, buildAdminDashboardUrl({
           tab: 'products',
+          products_scope: productScope,
           msg: 'Không thể xóa cứng, đã chuyển tạm ẩn.',
         }));
       } catch (nestedError) {
         redirectResponse(res, buildAdminDashboardUrl({
           tab: 'products',
+          products_scope: productScope,
           err: `Xóa sản phẩm thất bại: ${String(error.message || 'unknown')}`,
         }));
       }
@@ -2229,9 +2485,11 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
   if (pathname === productSyncPath && req.method === 'POST') {
     const rawBody = await readRawRequestBody(req);
     const form = parseFormUrlEncoded(rawBody);
+    const productScope = normalizeDashboardProductScope(form.products_scope);
+    const accountScope = normalizeDashboardAccountScope(form.account_scope);
     const productId = String(form.product_id || '').trim();
     if (!productId) {
-      redirectResponse(res, buildAdminDashboardUrl({ tab: 'products', err: 'Thiếu product_id để sync kho.' }));
+      redirectResponse(res, buildAdminDashboardUrl({ tab: 'products', products_scope: productScope, account_scope: accountScope, err: 'Thiếu product_id để sync kho.' }));
       return true;
     }
 
@@ -2241,12 +2499,16 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: targetTab,
         product_id: targetTab === 'accounts' ? productId : '',
+        products_scope: productScope,
+        account_scope: accountScope,
         msg: `Đã sync stock: ${Number(synced.stock_quantity || 0)}`,
       }));
       return true;
     } catch (error) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'products',
+        products_scope: productScope,
+        account_scope: accountScope,
         err: `Sync stock thất bại: ${String(error.message || 'unknown')}`,
       }));
       return true;
@@ -2256,6 +2518,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
   if (pathname === accountAddPath && req.method === 'POST') {
     const rawBody = await readRawRequestBody(req);
     const form = parseFormUrlEncoded(rawBody);
+    const productScope = normalizeDashboardProductScope(form.products_scope);
+    const accountScope = normalizeDashboardAccountScope(form.account_scope);
     const productId = String(form.product_id || '').trim();
     const accountLines = String(form.account_lines || '').trim();
 
@@ -2263,6 +2527,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'accounts',
         product_id: productId,
+        products_scope: productScope,
+        account_scope: accountScope,
         err: 'Vui lòng nhập dữ liệu account.',
       }));
       return true;
@@ -2274,6 +2540,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'accounts',
         product_id: productId,
+        products_scope: productScope,
+        account_scope: accountScope,
         msg: `Đã thêm ${result.added}/${result.total} dòng, stock=${Number(synced.stock_quantity || 0)}`,
       }));
       return true;
@@ -2281,7 +2549,62 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'accounts',
         product_id: productId,
+        products_scope: productScope,
+        account_scope: accountScope,
         err: `Thêm account thất bại: ${String(error.message || 'unknown')}`,
+      }));
+      return true;
+    }
+  }
+
+  if (pathname === accountUpdatePath && req.method === 'POST') {
+    const rawBody = await readRawRequestBody(req);
+    const form = parseFormUrlEncoded(rawBody);
+    const productScope = normalizeDashboardProductScope(form.products_scope);
+    const accountScope = normalizeDashboardAccountScope(form.account_scope);
+    const accountId = String(form.account_id || '').trim();
+    const productId = String(form.product_id || '').trim();
+    const accountData = String(form.account_data || '').trim();
+    if (!accountId || !accountData) {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'accounts',
+        product_id: productId,
+        products_scope: productScope,
+        account_scope: accountScope,
+        err: 'Thiếu dữ liệu để sửa account.',
+      }));
+      return true;
+    }
+
+    try {
+      const account = await loadProductAccountById(accountId);
+      if (!account) {
+        redirectResponse(res, buildAdminDashboardUrl({
+          tab: 'accounts',
+          product_id: productId,
+          products_scope: productScope,
+          account_scope: accountScope,
+          err: 'Không tìm thấy account.',
+        }));
+        return true;
+      }
+
+      await updateProductAccountDataById(accountId, accountData);
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'accounts',
+        product_id: account.product_id,
+        products_scope: productScope,
+        account_scope: accountScope,
+        msg: 'Đã cập nhật dữ liệu account.',
+      }));
+      return true;
+    } catch (error) {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'accounts',
+        product_id: productId,
+        products_scope: productScope,
+        account_scope: accountScope,
+        err: `Sửa account thất bại: ${String(error.message || 'unknown')}`,
       }));
       return true;
     }
@@ -2290,12 +2613,16 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
   if (pathname === accountDeletePath && req.method === 'POST') {
     const rawBody = await readRawRequestBody(req);
     const form = parseFormUrlEncoded(rawBody);
+    const productScope = normalizeDashboardProductScope(form.products_scope);
+    const accountScope = normalizeDashboardAccountScope(form.account_scope);
     const accountId = String(form.account_id || '').trim();
     const productId = String(form.product_id || '').trim();
     if (!accountId) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'accounts',
         product_id: productId,
+        products_scope: productScope,
+        account_scope: accountScope,
         err: 'Thiếu account_id để xóa.',
       }));
       return true;
@@ -2307,6 +2634,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
         redirectResponse(res, buildAdminDashboardUrl({
           tab: 'accounts',
           product_id: productId,
+          products_scope: productScope,
+          account_scope: accountScope,
           err: 'Không tìm thấy account.',
         }));
         return true;
@@ -2315,6 +2644,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
         redirectResponse(res, buildAdminDashboardUrl({
           tab: 'accounts',
           product_id: account.product_id || productId,
+          products_scope: productScope,
+          account_scope: accountScope,
           err: 'Account đã used, không xóa trực tiếp.',
         }));
         return true;
@@ -2325,6 +2656,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'accounts',
         product_id: account.product_id,
+        products_scope: productScope,
+        account_scope: accountScope,
         msg: 'Đã xóa account khỏi kho.',
       }));
       return true;
@@ -2332,6 +2665,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'accounts',
         product_id: productId,
+        products_scope: productScope,
+        account_scope: accountScope,
         err: `Xóa account thất bại: ${String(error.message || 'unknown')}`,
       }));
       return true;
@@ -2341,6 +2676,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
   if (pathname === accountStatePath && req.method === 'POST') {
     const rawBody = await readRawRequestBody(req);
     const form = parseFormUrlEncoded(rawBody);
+    const productScope = normalizeDashboardProductScope(form.products_scope);
+    const accountScope = normalizeDashboardAccountScope(form.account_scope);
     const accountId = String(form.account_id || '').trim();
     const productId = String(form.product_id || '').trim();
     const target = String(form.target || '').trim() === '1';
@@ -2348,6 +2685,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'accounts',
         product_id: productId,
+        products_scope: productScope,
+        account_scope: accountScope,
         err: 'Thiếu account_id để chuyển trạng thái.',
       }));
       return true;
@@ -2359,6 +2698,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
         redirectResponse(res, buildAdminDashboardUrl({
           tab: 'accounts',
           product_id: productId,
+          products_scope: productScope,
+          account_scope: accountScope,
           err: 'Không tìm thấy account.',
         }));
         return true;
@@ -2369,6 +2710,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'accounts',
         product_id: account.product_id,
+        products_scope: productScope,
+        account_scope: accountScope,
         msg: target ? 'Đã chuyển account sang used.' : 'Đã chuyển account về available.',
       }));
       return true;
@@ -2376,6 +2719,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       redirectResponse(res, buildAdminDashboardUrl({
         tab: 'accounts',
         product_id: productId,
+        products_scope: productScope,
+        account_scope: accountScope,
         err: `Cập nhật account thất bại: ${String(error.message || 'unknown')}`,
       }));
       return true;
@@ -2389,12 +2734,14 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
 
   const tab = normalizeDashboardTab(requestUrl.searchParams.get('tab'));
   const statusFilter = normalizeDashboardOrderStatus(requestUrl.searchParams.get('status_filter'));
+  const productScope = normalizeDashboardProductScope(requestUrl.searchParams.get('products_scope'));
+  const accountScope = normalizeDashboardAccountScope(requestUrl.searchParams.get('account_scope'));
   const infoMessage = String(requestUrl.searchParams.get('msg') || '').trim();
   const errorMessage = String(requestUrl.searchParams.get('err') || '').trim();
   const selectedProductIdRaw = String(requestUrl.searchParams.get('product_id') || '').trim();
 
   try {
-    const products = await loadDashboardProducts();
+    const products = await loadDashboardProducts(120, tab === 'products' ? productScope : 'all');
     const accountProductIds = products
       .filter((product) => usesAccountInventory(product))
       .map((product) => String(product.id || '').trim())
@@ -2410,13 +2757,15 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
     if (tab === 'accounts' && selectedProductId) {
       selectedProduct = await loadProductAny(selectedProductId);
       if (selectedProduct && usesAccountInventory(selectedProduct)) {
-        accountSummary = await loadAdminProductAccountsSummary(selectedProductId, 60);
+        accountSummary = await loadAdminProductAccountsSummary(selectedProductId, 60, accountScope);
       }
     }
 
     const html = renderAdminDashboardPage({
       tab,
       statusFilter,
+      productScope,
+      accountScope,
       infoMessage,
       errorMessage,
       orders,
@@ -2431,6 +2780,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
     sendHtml(res, 500, renderAdminDashboardPage({
       tab,
       statusFilter,
+      productScope,
+      accountScope,
       infoMessage: '',
       errorMessage: `Lỗi tải dashboard: ${String(error.message || 'unknown')}`,
       orders: [],
@@ -3717,16 +4068,24 @@ async function loadAdminProducts() {
   return data || [];
 }
 
-async function loadAdminProductAccountsSummary(productId, previewLimit = 20) {
+async function loadAdminProductAccountsSummary(productId, previewLimit = 20, scope = 'all') {
+  const safeScope = normalizeDashboardAccountScope(scope);
+  const previewQuery = db
+    .from('product_accounts')
+    .select('id,account_data,is_used,used_order_id,created_at,used_at')
+    .eq('product_id', productId)
+    .order('created_at', { ascending: true })
+    .limit(previewLimit);
+  if (safeScope === 'use') {
+    previewQuery.eq('is_used', false);
+  } else if (safeScope === 'used') {
+    previewQuery.eq('is_used', true);
+  }
+
   const [availableResp, usedResp, previewResp] = await Promise.all([
     db.from('product_accounts').select('id', { count: 'exact', head: true }).eq('product_id', productId).eq('is_used', false),
     db.from('product_accounts').select('id', { count: 'exact', head: true }).eq('product_id', productId).eq('is_used', true),
-    db
-      .from('product_accounts')
-      .select('id,account_data,is_used,used_order_id,created_at,used_at')
-      .eq('product_id', productId)
-      .order('created_at', { ascending: true })
-      .limit(previewLimit),
+    previewQuery,
   ]);
 
   if (availableResp.error) throw availableResp.error;
@@ -3736,6 +4095,7 @@ async function loadAdminProductAccountsSummary(productId, previewLimit = 20) {
   return {
     available: availableResp.count || 0,
     used: usedResp.count || 0,
+    scope: safeScope,
     preview: previewResp.data || [],
   };
 }
@@ -3858,6 +4218,21 @@ async function hardDeleteProduct(productId) {
     .delete()
     .eq('id', productId);
 
+  if (error) {
+    throw error;
+  }
+}
+
+async function updateProductAccountDataById(accountId, accountData) {
+  const payload = String(accountData || '').trim();
+  if (!payload) {
+    throw new Error('account_data_empty');
+  }
+
+  const { error } = await db
+    .from('product_accounts')
+    .update({ account_data: payload })
+    .eq('id', accountId);
   if (error) {
     throw error;
   }
@@ -4568,12 +4943,23 @@ async function processPurchase(ctx, user, locale, product, quantity = 1) {
     return;
   }
 
-  if (typeof product.stock_quantity === 'number' && product.stock_quantity < qty) {
+  if (!usesAccountInventory(product) && typeof product.stock_quantity === 'number' && product.stock_quantity < qty) {
     await safeReply(ctx, t(locale, 'outOfStock'));
     return;
   }
 
-  const order = await createSingleItemOrder(user.id, product, qty);
+  let order;
+  try {
+    order = await createSingleItemOrder(user.id, product, qty);
+  } catch (error) {
+    const reason = String(error?.message || '').toLowerCase();
+    if (reason.includes('out_of_stock') || reason.includes('insufficient_stock')) {
+      await safeReply(ctx, t(locale, 'outOfStock'));
+      return;
+    }
+    throw error;
+  }
+
   scheduleOrderExpiry(order.id);
   const unitPrice = calcUnitPriceByQuantity(product.price, qty);
   const createdMessage = await ctx.reply(buildOrderCreatedMessage(order, product, qty, unitPrice));
@@ -4793,6 +5179,7 @@ function buildHelpMessage(locale, admin = false) {
       '/menu - Xem danh sách gói',
       '/orders - Xem đơn hàng',
       '/me - Thông tin tài khoản',
+      '/clear [so_tin] - Dọn nhanh đoạn chat gần nhất',
       '/notifyall <noi_dung> - Gửi thông báo cho toàn bộ user',
       '/help - Trợ giúp',
     ].join('\n');
@@ -4806,6 +5193,7 @@ function buildHelpMessage(locale, admin = false) {
       '/menu - Browse packages',
       '/orders - View your orders',
       '/me - Your account info',
+      '/clear [count] - Clean recent chat messages',
       '/help - Help',
     ].join('\n');
   }
@@ -4817,6 +5205,7 @@ function buildHelpMessage(locale, admin = false) {
     '/menu - Xem danh sách gói',
     '/orders - Xem đơn hàng',
     '/me - Thông tin tài khoản',
+    '/clear [so_tin] - Dọn nhanh đoạn chat gần nhất',
     '/help - Trợ giúp',
   ].join('\n');
 }
@@ -4827,6 +5216,7 @@ async function registerChatMenuCommands() {
     { command: 'menu', description: 'Xem danh sach goi' },
     { command: 'orders', description: 'Xem don hang' },
     { command: 'me', description: 'Thong tin tai khoan' },
+    { command: 'clear', description: 'Don nhanh doan chat' },
     { command: 'help', description: 'Tro giup' },
   ];
 
@@ -4996,17 +5386,12 @@ bot.command('admin', async (ctx) => {
 });
 
 bot.command('clear', async (ctx) => {
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
-    await ctx.reply(t(locale, 'noAdmin'));
-    return;
-  }
+  await ensureUser(ctx);
 
   const payload = getCommandPayload(ctx.message.text, 'clear');
   const parsedCount = parseNonNegativeInt(payload);
   const requested = parsedCount === null ? 30 : parsedCount;
-  const count = Math.min(Math.max(requested, 1), 200);
+  const count = Math.min(Math.max(requested, 1), 100);
 
   const chatId = ctx.chat?.id;
   const currentMessageId = ctx.message?.message_id;
