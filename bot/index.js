@@ -281,29 +281,32 @@ async function expireUnpaidOrder(orderId) {
     console.error('restoreStockFromOrderItems failed (timeout):', error);
   }
 
-  try {
-    await db.from('order_history').insert({
-      order_id: updated.id,
-      changed_by: null,
-      status: 'cancelled',
-      comment: `Auto-cancelled after ${paymentTimeoutSeconds}s without payment`,
-    });
-  } catch (error) {
-    console.error('order_history insert (timeout cancel) failed:', error);
-  }
-
   await clearOrderPaymentMessages(updated.id);
+
+  const { data: deletedOrder, error: deleteError } = await db
+    .from('orders')
+    .delete()
+    .eq('id', updated.id)
+    .eq('status', 'cancelled')
+    .select('id,user_id')
+    .maybeSingle();
+  if (deleteError) {
+    throw deleteError;
+  }
+  if (!deletedOrder) {
+    return;
+  }
 
   try {
     const { data: owner } = await db
       .from('users')
       .select('telegram_id')
-      .eq('id', updated.user_id)
+      .eq('id', deletedOrder.user_id)
       .maybeSingle();
     if (owner?.telegram_id) {
       await bot.telegram.sendMessage(
         Number(owner.telegram_id),
-        `Đơn #${updated.id} đã tự hủy do quá ${paymentTimeoutSeconds} giây chưa thanh toán.`,
+        `Đơn #${deletedOrder.id} đã tự xóa do quá ${paymentTimeoutSeconds} giây chưa thanh toán.`,
       );
     }
   } catch (error) {
@@ -461,6 +464,7 @@ function buildPaidDeliveryMessage(order, sections, shortageCount) {
   const orderCode = String(order?.id || '').toUpperCase();
   const supportCode = buildSupportOrderCode(order?.id);
   const productName = sections[0]?.productName || '(khong ro)';
+  const deliveredAt = formatDateTimeVietnam(new Date());
 
   const lines = [
     '━━━━━━━━━━━━━━━━━━━━━━',
@@ -470,6 +474,7 @@ function buildPaidDeliveryMessage(order, sections, shortageCount) {
     `🔐 Mã đơn: #${orderCode}`,
     `🧷 Mã hỗ trợ: ${supportCode || '(N/A)'}`,
     `📦 Sản phẩm: ${productName}`,
+    `🗓 Ngày trả đơn: ${deliveredAt}`,
     '',
     '━━━━━━━━━━━━━━━━━━━━━━',
     '📌 TÀI KHOẢN (định dạng: TK | MK | 2FA)',
@@ -3349,6 +3354,7 @@ async function findOrderByTransferCode(transferCode) {
 }
 
 async function notifyOrderPaid(orderId, userId, amount, currency) {
+  const deliveredAt = formatDateTimeVietnam(new Date());
   const { data: owner, error: ownerError } = await db
     .from('users')
     .select('telegram_id')
@@ -3363,7 +3369,7 @@ async function notifyOrderPaid(orderId, userId, amount, currency) {
     try {
       await bot.telegram.sendMessage(
         Number(owner.telegram_id),
-        `Don #${orderId} da duoc xac nhan thanh toan.\nSo tien: ${amount} ${currency || 'VND'}`,
+        `Don #${orderId} da duoc xac nhan thanh toan.\nSo tien: ${amount} ${currency || 'VND'}\nNgay tra don: ${deliveredAt}`,
       );
     } catch (error) {
       // no-op
@@ -3375,7 +3381,7 @@ async function notifyOrderPaid(orderId, userId, amount, currency) {
     try {
       await bot.telegram.sendMessage(
         telegramId,
-        `MMOBank webhook: don #${orderId} da thanh toan.\nSo tien: ${amount} ${currency || 'VND'}`,
+        `MMOBank webhook: don #${orderId} da thanh toan.\nSo tien: ${amount} ${currency || 'VND'}\nNgay tra don: ${deliveredAt}`,
       );
     } catch (error) {
       // no-op
@@ -5168,7 +5174,7 @@ function buildMmobankInstruction(order) {
     `Chủ TK: ${mmobankAccountName || '(không bắt buộc)'}`,
     `Số tiền: ${formatPriceVnd(amount)} ${order.currency || 'VND'}`,
     `Nội dung CK: ${transferContent.toLowerCase()}`,
-    `⏱ Tự hủy sau ${paymentTimeoutSeconds}s nếu chưa thanh toán`,
+    `⏱ Tự xóa sau ${paymentTimeoutSeconds}s nếu chưa thanh toán`,
     '━━━━━━━━━━━━━━━━━━',
   ];
 
