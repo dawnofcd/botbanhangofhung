@@ -1715,6 +1715,9 @@ function createEmptyDashboardReports() {
       year: [],
     },
     byProduct: [],
+    byTypeDay: [],
+    byTypeMonth: [],
+    byTypeYear: [],
     byDay: [],
     byMonth: [],
     byYear: [],
@@ -1738,6 +1741,9 @@ function normalizeDashboardReports(reports) {
       year: Array.isArray(snapshot.year) ? snapshot.year : [],
     },
     byProduct: Array.isArray(reports.byProduct) ? reports.byProduct : [],
+    byTypeDay: Array.isArray(reports.byTypeDay) ? reports.byTypeDay : [],
+    byTypeMonth: Array.isArray(reports.byTypeMonth) ? reports.byTypeMonth : [],
+    byTypeYear: Array.isArray(reports.byTypeYear) ? reports.byTypeYear : [],
     byDay: Array.isArray(reports.byDay) ? reports.byDay : [],
     byMonth: Array.isArray(reports.byMonth) ? reports.byMonth : [],
     byYear: Array.isArray(reports.byYear) ? reports.byYear : [],
@@ -1776,6 +1782,17 @@ function formatDashboardPeriodLabel(periodKey, periodType) {
   }
 
   return raw;
+}
+
+function formatDashboardProductTypeLabel(productType) {
+  const normalized = String(productType || '').trim().toLowerCase();
+  if (normalized === 'code') {
+    return 'Code';
+  }
+  if (normalized === 'support') {
+    return 'Support';
+  }
+  return 'Account';
 }
 
 async function loadDashboardReports() {
@@ -1845,13 +1862,72 @@ async function loadDashboardReports() {
     group by period_key, coalesce(o.currency, 'VND')
     order by period_key desc, coalesce(o.currency, 'VND') asc
   `;
+  const buildByTypeQuantitySql = (periodFormat) => `
+    with raw_items as (
+      select
+        to_char(timezone('Asia/Ho_Chi_Minh', o.created_at), '${periodFormat}') as period_key,
+        oi.order_id,
+        oi.quantity,
+        lower(coalesce(p.name, '') || ' ' || coalesce(p.description, '')) as merged_text,
+        lower(coalesce(p.delivery_type, '')) as delivery_type
+      from order_items oi
+      join orders o on o.id = oi.order_id
+      left join products p on p.id = oi.product_id
+    ),
+    typed_items as (
+      select
+        period_key,
+        order_id,
+        quantity,
+        case
+          when merged_text like '%[type:code]%' or merged_text like '%[type:key]%' then 'code'
+          when merged_text like '%[type:account]%' then 'account'
+          when merged_text like '%[type:support]%' then 'support'
+          when merged_text like '%code%'
+            or merged_text like '%key%'
+            or merged_text like '%kich hoat%'
+            or merged_text like '%license%'
+            or merged_text like '%credit%' then 'code'
+          when delivery_type = 'manual'
+            or merged_text like '%support%'
+            or merged_text like '%gia han%'
+            or merged_text like '%nang cap%'
+            or merged_text like '%lien he%' then 'support'
+          else 'account'
+        end as product_type
+      from raw_items
+    )
+    select
+      period_key,
+      product_type,
+      coalesce(sum(quantity), 0)::bigint as total_quantity,
+      count(distinct order_id)::bigint as total_orders
+    from typed_items
+    group by period_key, product_type
+    order by period_key desc, product_type asc
+  `;
+  const byTypeDaySql = buildByTypeQuantitySql('YYYY-MM-DD');
+  const byTypeMonthSql = buildByTypeQuantitySql('YYYY-MM');
+  const byTypeYearSql = buildByTypeQuantitySql('YYYY');
 
-  const [snapshotResp, byProductResp, byDayResp, byMonthResp, byYearResp] = await Promise.all([
+  const [
+    snapshotResp,
+    byProductResp,
+    byDayResp,
+    byMonthResp,
+    byYearResp,
+    byTypeDayResp,
+    byTypeMonthResp,
+    byTypeYearResp,
+  ] = await Promise.all([
     db.query(snapshotSql),
     db.query(byProductSql),
     db.query(byDaySql),
     db.query(byMonthSql),
     db.query(byYearSql),
+    db.query(byTypeDaySql),
+    db.query(byTypeMonthSql),
+    db.query(byTypeYearSql),
   ]);
 
   if (snapshotResp.error) throw snapshotResp.error;
@@ -1859,6 +1935,9 @@ async function loadDashboardReports() {
   if (byDayResp.error) throw byDayResp.error;
   if (byMonthResp.error) throw byMonthResp.error;
   if (byYearResp.error) throw byYearResp.error;
+  if (byTypeDayResp.error) throw byTypeDayResp.error;
+  if (byTypeMonthResp.error) throw byTypeMonthResp.error;
+  if (byTypeYearResp.error) throw byTypeYearResp.error;
 
   const snapshot = {
     today: [],
@@ -1897,10 +1976,19 @@ async function loadDashboardReports() {
     orderCount: Math.max(0, Math.round(parseDashboardNumber(row.order_count))),
     totalRevenue: parseDashboardNumber(row.total_revenue),
   }));
+  const mapTypePeriodRows = (rows) => (rows || []).map((row) => ({
+    periodKey: String(row.period_key || '').trim(),
+    productType: String(row.product_type || 'account').trim().toLowerCase(),
+    totalQuantity: Math.max(0, Math.round(parseDashboardNumber(row.total_quantity))),
+    totalOrders: Math.max(0, Math.round(parseDashboardNumber(row.total_orders))),
+  }));
 
   return {
     snapshot,
     byProduct,
+    byTypeDay: mapTypePeriodRows(byTypeDayResp.data),
+    byTypeMonth: mapTypePeriodRows(byTypeMonthResp.data),
+    byTypeYear: mapTypePeriodRows(byTypeYearResp.data),
     byDay: mapPeriodRows(byDayResp.data),
     byMonth: mapPeriodRows(byMonthResp.data),
     byYear: mapPeriodRows(byYearResp.data),
@@ -2371,15 +2459,26 @@ function renderAdminDashboardPage({
   const reportByDayRows = buildReportPeriodRows(normalizedReports.byDay, 'day');
   const reportByMonthRows = buildReportPeriodRows(normalizedReports.byMonth, 'month');
   const reportByYearRows = buildReportPeriodRows(normalizedReports.byYear, 'year');
+  const buildReportTypeRows = (rows, periodType) => rows.map((row) => [
+    '<tr>',
+    `  <td>${escapeHtml(formatDashboardPeriodLabel(row.periodKey, periodType))}</td>`,
+    `  <td>${escapeHtml(formatDashboardProductTypeLabel(row.productType))}</td>`,
+    `  <td>${escapeHtml(String(row.totalQuantity))}</td>`,
+    `  <td>${escapeHtml(String(row.totalOrders))}</td>`,
+    '</tr>',
+  ].join('\n')).join('\n');
+  const reportTypeByDayRows = buildReportTypeRows(normalizedReports.byTypeDay, 'day');
+  const reportTypeByMonthRows = buildReportTypeRows(normalizedReports.byTypeMonth, 'month');
+  const reportTypeByYearRows = buildReportTypeRows(normalizedReports.byTypeYear, 'year');
 
   const reportPanel = [
     '<section class="panel">',
     '  <div class="panel-head">',
     '    <div>',
     '      <h2>Thống kê</h2>',
-    '      <p class="panel-subtitle">Báo cáo theo sản phẩm và doanh thu theo ngày/tháng/năm (toàn bộ lịch sử).</p>',
+    '      <p class="panel-subtitle">Báo cáo theo sản phẩm, theo loại sản phẩm, và doanh thu theo ngày/tháng/năm (toàn bộ lịch sử).</p>',
     '    </div>',
-    '  </div>',
+  '  </div>',
     `  <section class="stat-grid">${reportSnapshotCardsHtml}</section>`,
     '  <section class="report-section">',
     '    <h3>Theo sản phẩm</h3>',
@@ -2387,6 +2486,33 @@ function renderAdminDashboardPage({
     '      <table>',
     '        <thead><tr><th>#</th><th>Sản phẩm</th><th>Product ID</th><th>Số lượng bán</th><th>Doanh thu</th><th>Số đơn</th><th>Tiền tệ</th></tr></thead>',
     `        <tbody>${reportProductRows || '<tr><td colspan="7">Không có dữ liệu.</td></tr>'}</tbody>`,
+    '      </table>',
+    '    </div>',
+  '  </section>',
+    '  <section class="report-section">',
+    '    <h3>Số lượng theo loại sản phẩm (ngày)</h3>',
+    '    <div class="table-wrap">',
+    '      <table>',
+    '        <thead><tr><th>Ngày</th><th>Loại</th><th>Số lượng bán</th><th>Số đơn</th></tr></thead>',
+    `        <tbody>${reportTypeByDayRows || '<tr><td colspan="4">Không có dữ liệu.</td></tr>'}</tbody>`,
+    '      </table>',
+    '    </div>',
+    '  </section>',
+    '  <section class="report-section">',
+    '    <h3>Số lượng theo loại sản phẩm (tháng)</h3>',
+    '    <div class="table-wrap">',
+    '      <table>',
+    '        <thead><tr><th>Tháng</th><th>Loại</th><th>Số lượng bán</th><th>Số đơn</th></tr></thead>',
+    `        <tbody>${reportTypeByMonthRows || '<tr><td colspan="4">Không có dữ liệu.</td></tr>'}</tbody>`,
+    '      </table>',
+    '    </div>',
+    '  </section>',
+    '  <section class="report-section">',
+    '    <h3>Số lượng theo loại sản phẩm (năm)</h3>',
+    '    <div class="table-wrap">',
+    '      <table>',
+    '        <thead><tr><th>Năm</th><th>Loại</th><th>Số lượng bán</th><th>Số đơn</th></tr></thead>',
+    `        <tbody>${reportTypeByYearRows || '<tr><td colspan="4">Không có dữ liệu.</td></tr>'}</tbody>`,
     '      </table>',
     '    </div>',
     '  </section>',
