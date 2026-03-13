@@ -7,11 +7,27 @@ const { createClient } = require('./pg_client');
 
 function normalizeWebhookPath(rawValue, fallbackPath) {
   const fallback = String(fallbackPath || '/').trim() || '/';
-  const raw = String(rawValue || fallback).trim();
+  const raw = String(rawValue || '').trim();
   if (!raw) {
     return fallback;
   }
-  return raw.startsWith('/') ? raw : `/${raw}`;
+
+  let pathOnly = raw;
+  // Allow accidental full URL value (e.g. https://domain/sepay/webhook) in env.
+  if (/^https?:\/\//i.test(raw)) {
+    try {
+      const parsed = new URL(raw);
+      pathOnly = String(parsed.pathname || '').trim() || fallback;
+    } catch (error) {
+      pathOnly = raw;
+    }
+  }
+
+  const withLeadingSlash = pathOnly.startsWith('/') ? pathOnly : `/${pathOnly}`;
+  if (withLeadingSlash.length > 1 && withLeadingSlash.endsWith('/')) {
+    return withLeadingSlash.slice(0, -1);
+  }
+  return withLeadingSlash;
 }
 
 const botToken = process.env.TELEGRAM_TOKEN;
