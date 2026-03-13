@@ -1,4 +1,4 @@
-﻿# Tai Nguyen Hero (Railway + PostgreSQL)
+# Tai nguyen By DawnMmo (Railway + PostgreSQL)
 
 ## Goal
 Run Telegram sales bot on Railway (long polling) and store data in PostgreSQL.
@@ -7,20 +7,24 @@ Run Telegram sales bot on Railway (long polling) and store data in PostgreSQL.
 - `TELEGRAM_TOKEN`
 - `DATABASE_URL`
 
-Optional:
+## Optional environment variables
 - `PGSSL` (`true` by default)
 - `ADMIN_TELEGRAM_IDS`
 - `ADMIN_SECRET_KEY`
-- `MMOBANK_ACCOUNT_NO`
-
-Optional:
-- `MMOBANK_WEBHOOK_PATH` (default: `/mmobank/webhook`)
-- `MMOBANK_SECRET_KEY`
-- `MMOBANK_BANK_CODE`
-- `MMOBANK_ACCOUNT_NAME`
 - `ADMIN_DASHBOARD_KEY` (default fallback: `ADMIN_SECRET_KEY`)
 - `ADMIN_DASHBOARD_PATH` (default: `/admin`)
 - `ADMIN_DASHBOARD_SESSION_TTL_SECONDS` (default: `43200`)
+- `SEPAY_API_KEY`
+- `SEPAY_ACCOUNT_NO`
+- `SEPAY_BANK_CODE`
+- `SEPAY_ACCOUNT_NAME`
+- `SEPAY_WEBHOOK_PATH` (default: `/sepay/webhook`)
+- `PAYMENT_TIMEOUT_SECONDS` (optional, default `60`)
+- `ORDER_EXPIRY_SWEEP_INTERVAL_MS` (optional, default `15000`, min `5000`)
+- `BOT_DISPLAY_NAME` (default: `Tai nguyen By DawnMmo`)
+- `BOT_DESCRIPTION`
+- `BOT_SHORT_DESCRIPTION`
+- `SUPPORT_SHOP_NAME` (default fallback: `BOT_DISPLAY_NAME`)
 
 ## Database setup
 1. Open your PostgreSQL SQL console/tool.
@@ -41,45 +45,36 @@ If using Railway internal host (`*.railway.internal`), run the command inside Ra
 ## Deploy on Railway
 1. Push this repo to GitHub.
 2. Railway -> New Project -> Deploy from GitHub repo.
-3. In Railway Variables, set:
+3. In Railway Variables, set at least:
    - `TELEGRAM_TOKEN`
    - `DATABASE_URL`
-   - `PGSSL=true` (set `PGSSL=false` only for local non-SSL DB)
-   - `ADMIN_TELEGRAM_IDS` (optional)
-   - `ADMIN_SECRET_KEY` (optional)
-   - `MMOBANK_ACCOUNT_NO`
-   - `MMOBANK_WEBHOOK_PATH` (optional, default `/mmobank/webhook`)
-   - `MMOBANK_SECRET_KEY` (optional)
-   - `MMOBANK_BANK_CODE` (optional)
-   - `MMOBANK_ACCOUNT_NAME` (optional)
-   - `PAYMENT_TIMEOUT_SECONDS` (optional, default `60`)
-   - `ORDER_EXPIRY_SWEEP_INTERVAL_MS` (optional, default `15000`, min `5000`)
-   - `ADMIN_DASHBOARD_KEY` (optional but recommended for dashboard)
-   - `ADMIN_DASHBOARD_PATH` (optional, default `/admin`)
-   - `ADMIN_DASHBOARD_SESSION_TTL_SECONDS` (optional, default `43200`)
+   - `SEPAY_ACCOUNT_NO`
+   - `SEPAY_API_KEY` (recommended)
 4. Start command: `npm start` (already in `railway.json`).
 5. Redeploy and check logs for `Bot launched.`
 
 ## Admin dashboard (web)
-- URL mặc định: `/admin` (có thể đổi bằng `ADMIN_DASHBOARD_PATH`)
-- Đăng nhập bằng `ADMIN_DASHBOARD_KEY` (hoặc fallback `ADMIN_SECRET_KEY`)
-- Chức năng v1:
-  - Quản lý đơn hàng (đổi trạng thái trực tiếp)
-  - Quản lý sản phẩm (sửa giá/tồn/bật tắt)
-  - Quản lý kho account (xem preview, thêm account, sync tồn kho)
+- Default URL: `/admin` (can be changed by `ADMIN_DASHBOARD_PATH`)
+- Login key: `ADMIN_DASHBOARD_KEY`
 
-## MMOBank webhook setup
-1. Deploy bot, then get your public app URL from Railway.
-2. Set webhook URL in MMOBank to:
-   - `https://<your-app>.up.railway.app/mmobank/webhook`
-   - If you changed `MMOBANK_WEBHOOK_PATH`, use that path instead.
-3. If configured, MMOBank will call this endpoint with header `secret-key: <MMOBANK_SECRET_KEY>`.
-4. Bot auto-marks order as `paid` when transfer content contains the order code `DH...`, amount is valid, and account number matches `MMOBANK_ACCOUNT_NO` (when provided).
+## Sepay webhook setup
+1. Deploy bot and get public app URL from Railway.
+2. Set Sepay webhook URL to:
+   - `https://<your-app>.up.railway.app/sepay/webhook`
+   - If changed, use `SEPAY_WEBHOOK_PATH`.
+3. Send one of these headers with your key:
+   - `secret-key: <SEPAY_API_KEY>`
+   - `x-api-key: <SEPAY_API_KEY>`
+   - `api-key: <SEPAY_API_KEY>`
+   - `Authorization: Bearer <SEPAY_API_KEY>`
+4. Bot auto-marks order as `paid` when:
+   - transfer content contains order code `DH...`
+   - transfer amount is valid
+   - account number matches `SEPAY_ACCOUNT_NO` (when configured)
 
 ## Available bot functions
-- User: `/start`, Danh muc, Lich su, Ho tro, Ngon ngu, Dat ngay.
-- Admin: `/admin`, `/claimadmin`, Don moi, cap nhat trang thai don, bat/tat san pham, thong ke.
-- Admin utility: `/notify`, `/broadcast`.
+- User: `/start`, `/menu`, `/orders`, `/me`, `/help`
+- Admin: `/admin`, `/claimadmin`, product/order management, reports
 
 ## Admin guide
 - See `docs/admin_guide.md`

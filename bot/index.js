@@ -5,14 +5,23 @@ const http = require('http');
 const { Telegraf, Markup } = require('telegraf');
 const { createClient } = require('./pg_client');
 
+function normalizeWebhookPath(rawValue, fallbackPath) {
+  const fallback = String(fallbackPath || '/').trim() || '/';
+  const raw = String(rawValue || fallback).trim();
+  if (!raw) {
+    return fallback;
+  }
+  return raw.startsWith('/') ? raw : `/${raw}`;
+}
+
 const botToken = process.env.TELEGRAM_TOKEN;
 const databaseUrl = process.env.DATABASE_URL;
 const adminSecretKey = String(process.env.ADMIN_SECRET_KEY || '').trim();
-const mmobankSecretKey = process.env.MMOBANK_SECRET_KEY || process.env.SEPAY_API_KEY || '';
-const mmobankAccountNo = process.env.MMOBANK_ACCOUNT_NO || process.env.SEPAY_ACCOUNT_NO || '';
-const mmobankBankCode = process.env.MMOBANK_BANK_CODE || process.env.SEPAY_BANK_CODE || '';
-const mmobankAccountName = process.env.MMOBANK_ACCOUNT_NAME || process.env.SEPAY_ACCOUNT_NAME || '';
-const mmobankWebhookPath = process.env.MMOBANK_WEBHOOK_PATH || process.env.SEPAY_WEBHOOK_PATH || '/mmobank/webhook';
+const sepayApiKey = String(process.env.SEPAY_API_KEY || '').trim();
+const sepayAccountNo = String(process.env.SEPAY_ACCOUNT_NO || '').trim();
+const sepayBankCode = String(process.env.SEPAY_BANK_CODE || '').trim();
+const sepayAccountName = String(process.env.SEPAY_ACCOUNT_NAME || '').trim();
+const sepayWebhookPath = normalizeWebhookPath(process.env.SEPAY_WEBHOOK_PATH, '/sepay/webhook');
 const webhookPort = Number(process.env.PORT || process.env.WEBHOOK_PORT || 3000);
 const adminDashboardPath = (() => {
   const raw = String(process.env.ADMIN_DASHBOARD_PATH || '/admin').trim();
@@ -31,8 +40,13 @@ const adminDashboardSessionTtlSeconds = Number.isFinite(adminDashboardSessionTtl
   ? Math.round(adminDashboardSessionTtlSecondsRaw)
   : 43200;
 const adminDashboardSessionCookieName = 'admin_dash_session';
+const defaultBotDisplayName = 'Tài nguyên By DawnMmo';
+const botDisplayName = String(process.env.BOT_DISPLAY_NAME || defaultBotDisplayName).trim() || defaultBotDisplayName;
+const defaultBotDescription = `Mua tài nguyên số tại ${botDisplayName}, thanh toán nhanh, giao hàng tự động.`;
+const botDescription = String(process.env.BOT_DESCRIPTION || defaultBotDescription).trim() || defaultBotDescription;
+const botShortDescription = String(process.env.BOT_SHORT_DESCRIPTION || botDescription).trim() || botDescription;
 const supportZaloNumber = process.env.SUPPORT_ZALO || '0563228054';
-const supportShopName = process.env.SUPPORT_SHOP_NAME || 'Tài Nguyên Hero';
+const supportShopName = String(process.env.SUPPORT_SHOP_NAME || botDisplayName).trim() || botDisplayName;
 const supportZaloGroup = process.env.SUPPORT_ZALO_GROUP || '';
 const supportTelegramContact = process.env.SUPPORT_TELEGRAM || '';
 // Business rule: unpaid orders are auto-removed after exactly 60 seconds.
@@ -817,7 +831,7 @@ function buildPaidDeliveryMessage(order, sections, shortageCount, options = {}) 
 
 const TEXTS = {
   vi: {
-    welcome: 'Xin chào! Tôi là bot bán tài khoản.',
+    welcome: `Xin chào! Tôi là ${botDisplayName}.`,
     menuHint: 'Chọn một mục bên dưới:',
     emptyCatalogue: 'Danh mục hiện đang trống.',
     emptyHistory: 'Bạn chưa có đơn hàng nào.',
@@ -834,7 +848,7 @@ const TEXTS = {
     reportTitle: 'Báo cáo nhanh',
   },
   en: {
-    welcome: 'Welcome! I am your account shop bot.',
+    welcome: `Welcome! I am ${botDisplayName}.`,
     menuHint: 'Choose an option below:',
     emptyCatalogue: 'Catalogue is empty right now.',
     emptyHistory: 'You do not have any orders yet.',
@@ -1461,7 +1475,7 @@ async function createSingleItemOrder(userId, product, quantity = 1) {
     .insert({
       user_id: userId,
       status: 'confirmed',
-      payment_method: 'mmobank',
+      payment_method: 'sepay',
       total_amount: total,
       currency: product.currency || 'VND',
     })
@@ -1553,7 +1567,7 @@ async function notifyAdminsNewOrder(orderId, total, currency) {
     return;
   }
 
-  const message = `Đơn mới #${orderId}\nTổng tiền: ${total} ${currency}\nPhương thức: MMOBank`;
+  const message = `Đơn mới #${orderId}\nTổng tiền: ${total} ${currency}\nPhương thức: Sepay`;
   for (const telegramId of adminIds) {
     try {
       await bot.telegram.sendMessage(telegramId, message);
@@ -4051,7 +4065,7 @@ async function findOrderByTransferCode(transferCode) {
 
   const rows = data || [];
   for (const row of rows) {
-    const currentCode = buildMmobankTransferCode(row.id).toUpperCase();
+    const currentCode = buildPaymentTransferCode(row.id).toUpperCase();
     const legacyCode = `DH${String(row.id || '').replace(/-/g, '').slice(0, 10).toUpperCase()}`;
     if (currentCode === normalizedCode || legacyCode === normalizedCode) {
       return row;
@@ -4149,7 +4163,7 @@ async function notifyOrderPaid(orderId, userId, amount, currency) {
     try {
       await bot.telegram.sendMessage(
         telegramId,
-        `MMOBank webhook: don #${orderId} da thanh toan.\nMa DH: ${buildSupportOrderCode(orderId) || '(N/A)'}\nNguoi mua: ${buyerName}\nSo tien: ${formatPriceVnd(amount)} ${currency || 'VND'}\nThoi gian tra: ${deliveredAt}`,
+        `Sepay webhook: don #${orderId} da thanh toan.\nMa DH: ${buildSupportOrderCode(orderId) || '(N/A)'}\nNguoi mua: ${buyerName}\nSo tien: ${formatPriceVnd(amount)} ${currency || 'VND'}\nThoi gian tra: ${deliveredAt}`,
       );
     } catch (error) {
       // no-op
@@ -4309,7 +4323,7 @@ async function deliverAutoAccountsAfterPaid(order) {
   return { deliveredCount, shortageCount };
 }
 
-async function markOrderPaidFromMmobank(order, event) {
+async function markOrderPaidFromSepay(order, event) {
   if (!order) {
     return { ok: false, reason: 'order_not_found' };
   }
@@ -4340,7 +4354,7 @@ async function markOrderPaidFromMmobank(order, event) {
     order_id: updated.id,
     changed_by: null,
     status: 'paid',
-    comment: `Paid via MMOBank webhook (${txPart}; ${amountPart}; ${contentPart})`,
+    comment: `Paid via Sepay webhook (${txPart}; ${amountPart}; ${contentPart})`,
   });
 
   await notifyOrderPaid(updated.id, updated.user_id, updated.total_amount, updated.currency || 'VND');
@@ -4349,9 +4363,43 @@ async function markOrderPaidFromMmobank(order, event) {
   return { ok: true, alreadyPaid: false, order: updated };
 }
 
-async function handleMmobankWebhook(req, res, rawBody) {
-  const secretHeader = String(req.headers['secret-key'] || '').trim();
-  if (mmobankSecretKey && secretHeader !== mmobankSecretKey) {
+function normalizeWebhookSecretCandidate(raw) {
+  const value = String(raw || '').trim();
+  if (!value) {
+    return '';
+  }
+  const bearerMatch = value.match(/^bearer\s+(.+)$/i);
+  if (bearerMatch?.[1]) {
+    return String(bearerMatch[1]).trim();
+  }
+  const apikeyMatch = value.match(/^apikey\s+(.+)$/i);
+  if (apikeyMatch?.[1]) {
+    return String(apikeyMatch[1]).trim();
+  }
+  return value;
+}
+
+function collectWebhookSecretsFromHeaders(headers = {}) {
+  const candidates = [
+    headers['secret-key'],
+    headers['x-api-key'],
+    headers['api-key'],
+    headers.apikey,
+    headers.authorization,
+  ];
+  const values = new Set();
+  for (const candidate of candidates) {
+    const normalized = normalizeWebhookSecretCandidate(candidate);
+    if (normalized) {
+      values.add(normalized);
+    }
+  }
+  return values;
+}
+
+async function handleSepayWebhook(req, res, rawBody) {
+  const webhookSecrets = collectWebhookSecretsFromHeaders(req.headers || {});
+  if (sepayApiKey && !webhookSecrets.has(sepayApiKey)) {
     sendJson(res, 401, { ok: false, error: 'Unauthorized' });
     return;
   }
@@ -4364,7 +4412,7 @@ async function handleMmobankWebhook(req, res, rawBody) {
     return;
   }
 
-  const events = extractMmobankEvents(payload);
+  const events = extractSepayEvents(payload);
   if (events.length === 0) {
     sendJson(res, 202, { ok: true, ignored: 'missing_payload' });
     return;
@@ -4376,8 +4424,8 @@ async function handleMmobankWebhook(req, res, rawBody) {
   const paidOrderIds = [];
 
   for (const event of events) {
-    if (mmobankAccountNo && event.accountNo) {
-      const configured = String(mmobankAccountNo).trim();
+    if (sepayAccountNo && event.accountNo) {
+      const configured = String(sepayAccountNo).trim();
       const receivedAccountNo = String(event.accountNo).trim();
       if (configured && receivedAccountNo && configured !== receivedAccountNo) {
         ignoredCount += 1;
@@ -4410,7 +4458,7 @@ async function handleMmobankWebhook(req, res, rawBody) {
       }
     }
 
-    const result = await markOrderPaidFromMmobank(order, event);
+    const result = await markOrderPaidFromSepay(order, event);
     if (result.alreadyPaid) {
       await clearOrderPaymentMessages(order.id);
       alreadyPaidCount += 1;
@@ -4436,7 +4484,7 @@ async function handleMmobankWebhook(req, res, rawBody) {
   });
 }
 
-function startMmobankWebhookServer() {
+function startPaymentWebhookServer() {
   const server = http.createServer(async (req, res) => {
     const rawUrl = String(req.url || '/');
     const requestUrl = new URL(rawUrl, 'http://localhost');
@@ -4458,20 +4506,20 @@ function startMmobankWebhookServer() {
       return;
     }
 
-    if (req.method !== 'POST' || requestUrl.pathname !== mmobankWebhookPath) {
+    if (req.method !== 'POST' || requestUrl.pathname !== sepayWebhookPath) {
       sendJson(res, 404, { ok: false, error: 'Not found' });
       return;
     }
 
     try {
       const rawBody = await readRawRequestBody(req);
-      await handleMmobankWebhook(req, res, rawBody);
+      await handleSepayWebhook(req, res, rawBody);
     } catch (error) {
       if (String(error?.message || '').includes('payload_too_large')) {
         sendJson(res, 413, { ok: false, error: 'payload_too_large' });
         return;
       }
-      console.error('MMOBank webhook error:', error);
+      console.error('Sepay webhook error:', error);
       if (!res.headersSent) {
         sendJson(res, 500, { ok: false, error: 'internal_error' });
       }
@@ -4479,7 +4527,7 @@ function startMmobankWebhookServer() {
   });
 
   server.listen(webhookPort, () => {
-    console.log(`Webhook server listening on :${webhookPort}${mmobankWebhookPath} | admin: ${adminDashboardPath}`);
+    console.log(`Webhook server listening on :${webhookPort}${sepayWebhookPath} | admin: ${adminDashboardPath}`);
   });
 
   return server;
@@ -4867,7 +4915,7 @@ async function findAdminOrderByKeyword(keyword) {
   const matched = rows.find((row) => {
     const orderId = String(row.id || '');
     const orderIdLower = orderId.toLowerCase();
-    const shortCode = buildMmobankTransferCode(orderId).toUpperCase();
+    const shortCode = buildPaymentTransferCode(orderId).toUpperCase();
     const supportCode = buildSupportOrderCode(orderId).toUpperCase();
     const legacyCode = `DH${orderId.replace(/-/g, '').slice(0, 10).toUpperCase()}`;
 
@@ -5743,13 +5791,13 @@ function formatDateTimeVietnam(value) {
   }
 }
 
-function buildMmobankTransferCode(orderId) {
+function buildPaymentTransferCode(orderId) {
   const compact = String(orderId || '').trim().split('-')[0].replace(/[^a-zA-Z0-9]/g, '');
   return compact.slice(0, 8).toUpperCase();
 }
 
 function buildSupportOrderCode(orderId) {
-  const short = buildMmobankTransferCode(orderId);
+  const short = buildPaymentTransferCode(orderId);
   if (!short) {
     return '';
   }
@@ -5801,7 +5849,7 @@ function pickFirstNumber(values) {
   return null;
 }
 
-function extractMmobankEvent(payload) {
+function extractSepayEvent(payload) {
   const root = toObject(payload);
   const nestedData = toObject(root.data);
   const nestedTransfer = toObject(root.transfer);
@@ -5893,15 +5941,18 @@ function extractMmobankEvent(payload) {
   };
 }
 
-function extractMmobankEvents(payload) {
+function extractSepayEvents(payload) {
+  if (Array.isArray(payload)) {
+    return payload.map((item) => extractSepayEvent(item));
+  }
   const root = toObject(payload);
   if (Array.isArray(root.payload)) {
-    return root.payload.map((item) => extractMmobankEvent(item));
+    return root.payload.map((item) => extractSepayEvent(item));
   }
   if (root.payload && typeof root.payload === 'object') {
-    return [extractMmobankEvent(root.payload)];
+    return [extractSepayEvent(root.payload)];
   }
-  const event = extractMmobankEvent(root);
+  const event = extractSepayEvent(root);
   if (!event.transferCode && !event.content && !event.transactionId && !Number.isFinite(Number(event.amount))) {
     return [];
   }
@@ -5928,13 +5979,13 @@ function buildVietQrUrl({ bankCode, accountNo, accountName, amount, transferCont
   return `${base}?${params.toString()}`;
 }
 
-function buildMmobankInstruction(order) {
-  const transferContent = buildMmobankTransferCode(order.id);
+function buildSepayInstruction(order) {
+  const transferContent = buildPaymentTransferCode(order.id);
   const amount = Number(order.total_amount || 0);
   const qrUrl = buildVietQrUrl({
-    bankCode: mmobankBankCode,
-    accountNo: mmobankAccountNo,
-    accountName: mmobankAccountName,
+    bankCode: sepayBankCode,
+    accountNo: sepayAccountNo,
+    accountName: sepayAccountName,
     amount,
     transferContent,
   });
@@ -5943,26 +5994,27 @@ function buildMmobankInstruction(order) {
     '━━━━━━━━━━━━━━━━━━',
     '🏦 THÔNG TIN THANH TOÁN',
     '━━━━━━━━━━━━━━━━━━',
-    `Ngân hàng: ${mmobankBankCode || '(chưa cấu hình)'}`,
-    `Số tài khoản: ${mmobankAccountNo || '(chưa cấu hình)'}`,
-    `Chủ TK: ${mmobankAccountName || '(không bắt buộc)'}`,
+    `Cổng thanh toán: Sepay`,
+    `Ngân hàng: ${sepayBankCode || '(chưa cấu hình)'}`,
+    `Số tài khoản: ${sepayAccountNo || '(chưa cấu hình)'}`,
+    `Chủ TK: ${sepayAccountName || '(không bắt buộc)'}`,
     `Số tiền: ${formatPriceVnd(amount)} ${order.currency || 'VND'}`,
     `Nội dung CK: ${transferContent.toLowerCase()}`,
     `⏱ Tự xóa sau ${paymentTimeoutSeconds}s nếu chưa thanh toán`,
     '━━━━━━━━━━━━━━━━━━',
   ];
 
-  if (!mmobankAccountNo) {
-    lines.push('Lưu ý: Chưa cấu hình MMOBANK_ACCOUNT_NO trong .env.');
-  } else if (!mmobankBankCode) {
-    lines.push('Lưu ý: Chưa cấu hình MMOBANK_BANK_CODE nên không tạo được QR.');
+  if (!sepayAccountNo) {
+    lines.push('Lưu ý: Chưa cấu hình SEPAY_ACCOUNT_NO trong .env.');
+  } else if (!sepayBankCode) {
+    lines.push('Lưu ý: Chưa cấu hình SEPAY_BANK_CODE nên không tạo được QR.');
   }
 
   return { text: lines.join('\n'), qrUrl, transferContent };
 }
 
 function buildOrderCreatedMessage(order, product, quantity, unitPrice) {
-  const transferContent = String(order?.id || '').trim().split('-')[0] || buildMmobankTransferCode(order?.id);
+  const transferContent = String(order?.id || '').trim().split('-')[0] || buildPaymentTransferCode(order?.id);
   const supportCode = buildSupportOrderCode(order?.id);
   const currency = order?.currency || 'VND';
   const total = Number(order?.total_amount || 0);
@@ -6272,19 +6324,19 @@ async function processPurchase(ctx, user, locale, product, quantity = 1) {
     await rememberOrderPaymentMessageRef(order.id, createdMessage.chat.id, createdMessage.message_id, 'created');
   }
 
-  const mmobank = buildMmobankInstruction(order);
+  const sepay = buildSepayInstruction(order);
   let paymentMessage = null;
-  if (mmobank.qrUrl) {
+  if (sepay.qrUrl) {
     try {
-      paymentMessage = await ctx.replyWithPhoto(mmobank.qrUrl, {
-        caption: mmobank.text,
+      paymentMessage = await ctx.replyWithPhoto(sepay.qrUrl, {
+        caption: sepay.text,
         ...Markup.inlineKeyboard([
           [Markup.button.callback('Tôi đã chuyển khoản', `paydone:${order.id}`)],
         ]),
       });
     } catch (error) {
       paymentMessage = await ctx.reply(
-        mmobank.text,
+        sepay.text,
         Markup.inlineKeyboard([
           [Markup.button.callback('Tôi đã chuyển khoản', `paydone:${order.id}`)],
         ]),
@@ -6292,7 +6344,7 @@ async function processPurchase(ctx, user, locale, product, quantity = 1) {
     }
   } else {
     paymentMessage = await ctx.reply(
-      mmobank.text,
+      sepay.text,
       Markup.inlineKeyboard([
         [Markup.button.callback('Tôi đã chuyển khoản', `paydone:${order.id}`)],
       ]),
@@ -6525,10 +6577,11 @@ async function registerChatMenuCommands() {
   const adminCommands = [...userCommands];
 
   try {
-    await bot.telegram.setMyDescription('Mua gói dịch vụ số, thanh toán nhanh, giao hàng tự động.');
-    await bot.telegram.setMyShortDescription('Mua gói dịch vụ số, thanh toán nhanh, giao hàng tự động.');
+    await bot.telegram.callApi('setMyName', { name: botDisplayName });
+    await bot.telegram.setMyDescription(botDescription);
+    await bot.telegram.setMyShortDescription(botShortDescription);
   } catch (error) {
-    // ignore description sync failures
+    // ignore bot profile sync failures
   }
 
   // Default command set for all private chats.
@@ -7153,7 +7206,7 @@ bot.action(/^paydone:(.+)$/, async (ctx) => {
     return;
   }
 
-  const transferContent = buildMmobankTransferCode(order.id);
+  const transferContent = buildPaymentTransferCode(order.id);
   await ctx.answerCbQuery(locale === 'en' ? 'Sent to admin' : 'Đã báo admin');
   const confirmation = locale === 'en'
     ? `Payment notice sent. Admin will verify your transfer.\nOrder: #${order.id}\nTransfer content: ${transferContent}`
@@ -7170,7 +7223,7 @@ bot.action(/^paydone:(.+)$/, async (ctx) => {
     try {
       await bot.telegram.sendMessage(
         telegramId,
-        `Bao thanh toan MMOBANK\nDon: #${order.id}\nUser: ${user.id}\nSo tien: ${order.total_amount} ${order.currency || 'VND'}\nNoi dung CK: ${transferContent}`,
+        `Bao thanh toan SEPAY\nDon: #${order.id}\nUser: ${user.id}\nSo tien: ${order.total_amount} ${order.currency || 'VND'}\nNoi dung CK: ${transferContent}`,
       );
     } catch (error) {
       // no-op
@@ -7923,7 +7976,7 @@ bot.catch(async (err, ctx) => {
   console.error('Bot error', err);
 });
 
-const webhookServer = startMmobankWebhookServer();
+const webhookServer = startPaymentWebhookServer();
 
 bot.launch().then(async () => {
   startOrderExpirySweeper();
