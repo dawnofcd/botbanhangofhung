@@ -885,6 +885,23 @@ async function ensureUser(ctx) {
     .single();
 
   if (insertError) {
+    const insertErrorCode = String(insertError.code || '').trim();
+    const insertErrorMessage = String(insertError.message || '').toLowerCase();
+    const duplicateKeyDetected = insertErrorCode === '23505'
+      || insertErrorMessage.includes('duplicate key');
+    if (duplicateKeyDetected) {
+      const { data: retriedUser, error: retryError } = await db
+        .from('users')
+        .select('*')
+        .eq('telegram_id', Number(telegramId))
+        .maybeSingle();
+      if (retryError) {
+        throw retryError;
+      }
+      if (retriedUser) {
+        return retriedUser;
+      }
+    }
     throw insertError;
   }
 

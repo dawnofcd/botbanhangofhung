@@ -27,6 +27,12 @@ Optional:
 2. Run `docs/supabase_schema.sql`.
 3. Run `docs/supabase_seed.sql`.
 
+Or use script:
+- `npm run db:init` (schema only)
+- `npm run db:init:seed` (schema + seed)
+
+If using Railway internal host (`*.railway.internal`), run the command inside Railway runtime (service shell or deploy command).
+
 ## Local run
 1. `npm install`
 2. Fill `.env`
