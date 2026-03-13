@@ -654,13 +654,78 @@ function formatBuyerDisplayName(userRecord) {
   return '(khong ro)';
 }
 
-function buildPaidInvoiceMessage(orderId, amount, currency, paidAt, buyerName) {
+function normalizeUsageCategoryKey(categoryKey, deliveryType = '') {
+  const normalizedDeliveryType = String(deliveryType || '').toLowerCase();
+  const normalizedCategory = normalizeProductCategoryKey(categoryKey || 'all');
+  if (normalizedDeliveryType === 'manual') {
+    return 'support';
+  }
+  if (normalizedCategory === 'code' || normalizedCategory === 'account' || normalizedCategory === 'support') {
+    return normalizedCategory;
+  }
+  return 'account';
+}
+
+function usageCategoryLabel(categoryKey) {
+  if (categoryKey === 'code') {
+    return 'KEY/CODE';
+  }
+  if (categoryKey === 'support') {
+    return 'HỖ TRỢ THỦ CÔNG';
+  }
+  return 'ACCOUNT';
+}
+
+function buildPostPurchaseUsageGuideLines(items, supportCode) {
+  const rows = Array.isArray(items) ? items : [];
+  if (!rows.length) {
+    return [];
+  }
+
+  const lines = [
+    '━━━━━━━━━━━━━━━━━━━━━━',
+    '📚 HƯỚNG DẪN SỬ DỤNG',
+    '━━━━━━━━━━━━━━━━━━━━━━',
+    '',
+  ];
+
+  for (const row of rows) {
+    const productName = String(row?.productName || '').trim() || '(không rõ sản phẩm)';
+    const quantityRaw = Number(row?.quantity || 1);
+    const quantity = Number.isInteger(quantityRaw) && quantityRaw > 0 ? quantityRaw : 1;
+    const categoryKey = normalizeUsageCategoryKey(row?.categoryKey, row?.deliveryType);
+    const typeLabel = usageCategoryLabel(categoryKey);
+    const manualNote = String(row?.manualContactNote || '').trim();
+
+    lines.push(`• ${productName} x${quantity} | Loại: ${typeLabel}`);
+    if (categoryKey === 'code') {
+      lines.push('  - Cách dùng: vào mục Redeem/Activate đúng nền tảng rồi nhập key.');
+      lines.push('  - Lưu ý: key thường chỉ dùng 1 lần, không chia sẻ cho người khác.');
+    } else if (categoryKey === 'account') {
+      lines.push('  - Cách dùng: đăng nhập bằng TK/MK bot cấp và kiểm tra đúng gói dịch vụ.');
+      lines.push('  - Lưu ý: đổi mật khẩu ngay nếu hệ thống cho phép để bảo vệ tài khoản.');
+    } else {
+      lines.push('  - Cách dùng: liên hệ shop để xử lý thủ công sau thanh toán.');
+      if (manualNote) {
+        lines.push(`  - Lưu ý: ${manualNote}`);
+      } else {
+        lines.push(`  - Lưu ý: gửi mã hỗ trợ ${supportCode || '(N/A)'} cho shop qua Zalo ${supportZaloNumber}.`);
+      }
+    }
+    lines.push('');
+  }
+
+  return lines;
+}
+
+function buildPaidInvoiceMessage(orderId, amount, currency, paidAt, buyerName, options = {}) {
   const supportCode = buildSupportOrderCode(orderId);
   const orderCode = String(orderId || '').toUpperCase();
   const paidAtText = formatDateTimeVietnam(paidAt || new Date());
   const buyerText = String(buyerName || '').trim() || '(khong ro)';
+  const usageLines = buildPostPurchaseUsageGuideLines(options.usageItems || [], supportCode);
 
-  return [
+  const lines = [
     '━━━━━━━━━━━━━━━━━━━━━━',
     '🧾 HÓA ĐƠN THANH TOÁN',
     '━━━━━━━━━━━━━━━━━━━━━━',
@@ -670,10 +735,15 @@ function buildPaidInvoiceMessage(orderId, amount, currency, paidAt, buyerName) {
     `👤 Người mua: ${buyerText}`,
     `🕒 Thời gian trả: ${paidAtText}`,
     `💰 Tổng tiền: ${formatPriceVnd(amount)} ${currency || 'VND'}`,
-    '',
-    'Cảm ơn bạn đã mua hàng ✅',
-    '━━━━━━━━━━━━━━━━━━━━━━',
-  ].join('\n');
+  ];
+  if (usageLines.length > 0) {
+    lines.push('');
+    lines.push(...usageLines);
+  }
+  lines.push('');
+  lines.push('Cảm ơn bạn đã mua hàng ✅');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━');
+  return lines.join('\n');
 }
 
 function buildPaidDeliveryMessage(order, sections, shortageCount, options = {}) {
@@ -682,6 +752,16 @@ function buildPaidDeliveryMessage(order, sections, shortageCount, options = {}) 
   const productName = sections[0]?.productName || '(khong ro)';
   const deliveredAt = formatDateTimeVietnam(options.deliveredAt || new Date());
   const buyerName = String(options.buyerName || '').trim() || '(khong ro)';
+  const usageLines = buildPostPurchaseUsageGuideLines(
+    (sections || []).map((section) => ({
+      productName: section.productName,
+      quantity: Array.isArray(section.accounts) ? section.accounts.length : 1,
+      categoryKey: section.categoryKey,
+      deliveryType: section.deliveryType,
+      manualContactNote: section.manualContactNote,
+    })),
+    supportCode,
+  );
 
   const lines = [
     '━━━━━━━━━━━━━━━━━━━━━━',
@@ -713,6 +793,10 @@ function buildPaidDeliveryMessage(order, sections, shortageCount, options = {}) 
       lines.push(`🛡 2FA: ${parsed.twofa}`);
       lines.push('');
     });
+  }
+
+  if (usageLines.length > 0) {
+    lines.push(...usageLines);
   }
 
   lines.push('━━━━━━━━━━━━━━━━━━━━━━');
@@ -1842,7 +1926,7 @@ function parseFormUrlEncoded(rawBody) {
 
 function normalizeDashboardTab(rawTab) {
   const tab = String(rawTab || '').trim().toLowerCase();
-  if (tab === 'products' || tab === 'accounts' || tab === 'reports') {
+  if (tab === 'products' || tab === 'accounts' || tab === 'reports' || tab === 'notify') {
     return tab;
   }
   return 'orders';
@@ -1974,6 +2058,43 @@ async function loadDashboardProducts(limit = 120, scope = 'active') {
   return data || [];
 }
 
+async function loadDashboardNotifyUsers(limit = 200) {
+  const maxRows = Number.isFinite(Number(limit)) ? Math.max(1, Math.round(Number(limit))) : 200;
+  const { data, error } = await db
+    .from('users')
+    .select('id,telegram_id,username,display_name,role,language_code,created_at')
+    .not('telegram_id', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(maxRows);
+
+  if (error) {
+    throw error;
+  }
+
+  const uniqueByTelegram = new Set();
+  const rows = [];
+  for (const row of (data || [])) {
+    const telegramId = Number(row?.telegram_id);
+    if (!Number.isInteger(telegramId) || telegramId <= 0) {
+      continue;
+    }
+    if (uniqueByTelegram.has(telegramId)) {
+      continue;
+    }
+    uniqueByTelegram.add(telegramId);
+    rows.push({
+      id: String(row.id || '').trim(),
+      telegramId,
+      username: String(row.username || '').trim(),
+      displayName: String(row.display_name || '').trim(),
+      role: String(row.role || 'customer').trim(),
+      languageCode: String(row.language_code || 'vi').trim(),
+      createdAt: row.created_at || null,
+    });
+  }
+  return rows;
+}
+
 function parseDashboardNumber(value) {
   const parsed = Number(value || 0);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -2059,6 +2180,101 @@ function formatDashboardPeriodLabel(periodKey, periodType) {
   }
 
   return raw;
+}
+
+function pickDashboardPrimaryCurrency(seriesRows, fallbackCurrency = 'VND') {
+  const rows = Array.isArray(seriesRows) ? seriesRows : [];
+  const revenueByCurrency = new Map();
+  for (const row of rows) {
+    const currency = normalizeDashboardCurrency(row.currency || fallbackCurrency);
+    const revenue = parseDashboardNumber(row.totalRevenue);
+    const current = revenueByCurrency.get(currency) || 0;
+    revenueByCurrency.set(currency, current + revenue);
+  }
+  if (!revenueByCurrency.size) {
+    return normalizeDashboardCurrency(fallbackCurrency);
+  }
+  let selected = normalizeDashboardCurrency(fallbackCurrency);
+  let maxRevenue = -1;
+  for (const [currency, revenue] of revenueByCurrency.entries()) {
+    if (revenue > maxRevenue) {
+      maxRevenue = revenue;
+      selected = currency;
+    }
+  }
+  return selected;
+}
+
+function aggregateDashboardRevenueRowsByPeriod(rows, currency, limit = 12) {
+  const list = Array.isArray(rows) ? rows : [];
+  const preferredCurrency = String(currency || '').trim().toUpperCase();
+  const grouped = new Map();
+  for (const row of list) {
+    const rowCurrency = normalizeDashboardCurrency(row.currency);
+    if (preferredCurrency && rowCurrency !== preferredCurrency) {
+      continue;
+    }
+    const key = String(row.periodKey || '').trim();
+    if (!key) {
+      continue;
+    }
+    const current = grouped.get(key) || { periodKey: key, orderCount: 0, totalRevenue: 0, currency: rowCurrency };
+    current.orderCount += Math.max(0, Math.round(parseDashboardNumber(row.orderCount)));
+    current.totalRevenue += parseDashboardNumber(row.totalRevenue);
+    current.currency = rowCurrency;
+    grouped.set(key, current);
+  }
+
+  return [...grouped.values()]
+    .sort((a, b) => String(b.periodKey).localeCompare(String(a.periodKey)))
+    .slice(0, Math.max(1, Number(limit) || 12));
+}
+
+function resolveDashboardReportCategory(row, productsById = new Map()) {
+  const productId = String(row?.productId || '').trim();
+  if (productId && productsById.has(productId)) {
+    return inferProductCategoryKey(productsById.get(productId));
+  }
+
+  const productName = String(row?.productName || '').trim();
+  if (productName) {
+    return inferProductCategoryKey({ name: productName, description: '', delivery_type: 'auto' });
+  }
+
+  return 'account';
+}
+
+function aggregateDashboardTypeQuantityByPeriod(rows, productsById = new Map(), limit = 12) {
+  const list = Array.isArray(rows) ? rows : [];
+  const grouped = new Map();
+  for (const row of list) {
+    const periodKey = String(row?.periodKey || '').trim();
+    if (!periodKey) {
+      continue;
+    }
+    const quantity = Math.max(0, Math.round(parseDashboardNumber(row?.totalQuantity)));
+    const category = normalizeProductCategoryKey(resolveDashboardReportCategory(row, productsById));
+    const current = grouped.get(periodKey) || {
+      periodKey,
+      code: 0,
+      account: 0,
+      support: 0,
+      totalQuantity: 0,
+      totalOrders: 0,
+    };
+    if (category === 'code' || category === 'account' || category === 'support') {
+      current[category] += quantity;
+    } else {
+      current.account += quantity;
+    }
+    current.totalQuantity += quantity;
+    current.totalOrders += Math.max(0, Math.round(parseDashboardNumber(row?.totalOrders)));
+    grouped.set(periodKey, current);
+  }
+
+  return [...grouped.values()]
+    .sort((a, b) => String(b.periodKey).localeCompare(String(a.periodKey)))
+    .slice(0, Math.max(1, Number(limit) || 12));
 }
 
 function buildDashboardOrderDateFilter(filters, orderAlias = 'o') {
@@ -2347,6 +2563,7 @@ function renderAdminDashboardPage({
   selectedProduct = null,
   accountSummary = null,
   reports = createEmptyDashboardReports(),
+  notifyUsers = [],
 }) {
   const safeTab = normalizeDashboardTab(tab);
   const safeStatusFilter = normalizeDashboardOrderStatus(statusFilter);
@@ -2375,6 +2592,7 @@ function renderAdminDashboardPage({
   const navProductsClass = safeTab === 'products' ? 'tab active' : 'tab';
   const navAccountsClass = safeTab === 'accounts' ? 'tab active' : 'tab';
   const navReportsClass = safeTab === 'reports' ? 'tab active' : 'tab';
+  const navNotifyClass = safeTab === 'notify' ? 'tab active' : 'tab';
   const accountProducts = products.filter((product) => usesAccountInventory(product));
   const effectiveSelectedProductId = String(
     selectedProductId
@@ -2394,6 +2612,11 @@ function renderAdminDashboardPage({
       date_from: safeReportFilters.dateFrom,
       date_to: safeReportFilters.dateTo,
     }))}">Thống kê</a>`,
+    `<a class="${navNotifyClass}" href="${escapeHtml(buildAdminDashboardUrl({
+      tab: 'notify',
+      products_scope: safeProductScope,
+      account_scope: safeAccountScope,
+    }))}">Thông báo</a>`,
   ].join('');
 
   const orderStats = {
@@ -2446,15 +2669,10 @@ function renderAdminDashboardPage({
     `<a class="${safeProductScope === 'all' ? 'chip active' : 'chip'}" href="${escapeHtml(buildAdminDashboardUrl({ tab: 'products', products_scope: 'all' }))}">Tất cả</a>`,
   ].join('');
 
-  const orderRows = orders.map((order) => {
-    const buyer = formatBuyerLabel(order);
-    const currentStatus = String(order.status || '').toLowerCase();
-    const status = statusMeta[currentStatus] || { label: currentStatus || 'N/A', className: 'neutral' };
-    const itemPreview = order.item_preview
-      ? `${order.item_preview.firstProductName || '(N/A)'} x${order.item_preview.totalQuantity || 0}`
-      : '(chưa có dòng sản phẩm)';
+  const buildOrderActionForms = (order) => {
+    const currentStatus = String(order?.status || '').toLowerCase();
     const actionStatuses = ['confirmed', 'paid', 'cancelled'].filter((statusKey) => statusKey !== currentStatus);
-    const actionForms = actionStatuses.map((actionStatus) => {
+    return actionStatuses.map((actionStatus) => {
       const meta = orderActionMeta[actionStatus] || { label: actionStatus, className: 'btn-neutral' };
       return [
         `<form method="post" action="${escapeHtml(`${adminDashboardPath}/order-status`)}">`,
@@ -2466,19 +2684,47 @@ function renderAdminDashboardPage({
         '</form>',
       ].join('\n');
     }).join('\n');
+  };
 
-    const shortId = String(order.id || '').slice(0, 8);
+  const pendingOrders = orders.filter((order) => {
+    const status = String(order?.status || '').toLowerCase();
+    return status === 'draft' || status === 'confirmed';
+  });
+
+  const pendingQuickRows = pendingOrders.slice(0, 12).map((order) => {
+    const buyer = formatBuyerLabel(order);
+    const status = statusMeta[String(order.status || '').toLowerCase()] || { label: String(order.status || 'N/A'), className: 'neutral' };
+    const supportCode = buildSupportOrderCode(order.id) || `DH${String(order.id || '').slice(0, 8).toUpperCase()}`;
+    return [
+      '<tr>',
+      `  <td><strong>${escapeHtml(supportCode)}</strong><br /><code>${escapeHtml(order.id)}</code></td>`,
+      `  <td>${escapeHtml(buyer)}</td>`,
+      `  <td>${escapeHtml(formatPriceVnd(order.total_amount))} ${escapeHtml(order.currency || 'VND')}</td>`,
+      `  <td>${escapeHtml(formatDashboardDateTime(order.created_at))}</td>`,
+      `  <td><span class="status-badge ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span></td>`,
+      `  <td class="actions">${buildOrderActionForms(order) || '-'}</td>`,
+      '</tr>',
+    ].join('\n');
+  }).join('\n');
+
+  const orderRows = orders.map((order) => {
+    const buyer = formatBuyerLabel(order);
+    const currentStatus = String(order.status || '').toLowerCase();
+    const status = statusMeta[currentStatus] || { label: currentStatus || 'N/A', className: 'neutral' };
+    const itemPreview = order.item_preview
+      ? `${order.item_preview.firstProductName || '(N/A)'} x${order.item_preview.totalQuantity || 0}`
+      : '(chưa có dòng sản phẩm)';
+    const supportCode = buildSupportOrderCode(order.id) || `DH${String(order.id || '').slice(0, 8).toUpperCase()}`;
     return [
       '<tr>',
       '  <td>',
-      `    <div class="id-stack"><strong>#${escapeHtml(shortId)}</strong><code>${escapeHtml(order.id)}</code></div>`,
+      `    <div class="id-stack"><strong>${escapeHtml(supportCode)}</strong><code>${escapeHtml(order.id)}</code><span class="muted-text">${escapeHtml(itemPreview)}</span></div>`,
       '  </td>',
       `  <td>${escapeHtml(buyer)}</td>`,
-      `  <td>${escapeHtml(itemPreview)}</td>`,
       `  <td><span class="status-badge ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span></td>`,
       `  <td>${escapeHtml(formatPriceVnd(order.total_amount))} ${escapeHtml(order.currency || 'VND')}</td>`,
       `  <td>${escapeHtml(formatDashboardDateTime(order.created_at))}</td>`,
-      `  <td class="actions">${actionForms || '-'}</td>`,
+      `  <td class="actions">${buildOrderActionForms(order) || '-'}</td>`,
       '</tr>',
     ].join('\n');
   }).join('\n');
@@ -2487,8 +2733,8 @@ function renderAdminDashboardPage({
     '<section class="panel">',
     '  <div class="panel-head">',
     '    <div>',
-    '      <h2>Đơn hàng</h2>',
-    `      <p class="panel-subtitle">Theo dõi trạng thái thanh toán và xử lý nhanh theo từng đơn.</p>`,
+      '      <h2>Đơn hàng</h2>',
+    `      <p class="panel-subtitle">Ưu tiên xem đơn chờ xử lý trước, thao tác đổi trạng thái ngay trên cùng một màn hình.</p>`,
     '    </div>',
     `    <form method="get" action="${escapeHtml(adminDashboardPath)}" class="inline-form">`,
     '      <input type="hidden" name="tab" value="orders" />',
@@ -2498,12 +2744,24 @@ function renderAdminDashboardPage({
     '    </form>',
     '  </div>',
     `  <div class="chips">${quickFilterLinks}</div>`,
+    '  <section class="report-section">',
+    `    <h3>Cần xử lý ngay (${pendingOrders.length})</h3>`,
+    '    <div class="table-wrap">',
+    '      <table>',
+    '        <thead><tr><th>Mã đơn</th><th>Người mua</th><th>Tổng tiền</th><th>Tạo lúc</th><th>Trạng thái</th><th>Hành động nhanh</th></tr></thead>',
+    `        <tbody>${pendingQuickRows || '<tr><td colspan="6">Không có đơn chờ xử lý.</td></tr>'}</tbody>`,
+    '      </table>',
+    '    </div>',
+    '  </section>',
+    '  <section class="report-section">',
+    '    <h3>Tất cả đơn theo bộ lọc</h3>',
     '  <div class="table-wrap">',
     '    <table>',
-      '      <thead><tr><th>ID</th><th>Người mua</th><th>Sản phẩm</th><th>Trạng thái</th><th>Tổng</th><th>Tạo lúc</th><th>Hành động</th></tr></thead>',
-    `      <tbody>${orderRows || '<tr><td colspan="7">Không có dữ liệu.</td></tr>'}</tbody>`,
+      '      <thead><tr><th>Mã đơn + sản phẩm</th><th>Người mua</th><th>Trạng thái</th><th>Tổng</th><th>Tạo lúc</th><th>Hành động</th></tr></thead>',
+    `      <tbody>${orderRows || '<tr><td colspan="6">Không có dữ liệu.</td></tr>'}</tbody>`,
     '    </table>',
     '  </div>',
+    '  </section>',
     '</section>',
   ].join('\n');
 
@@ -2709,66 +2967,6 @@ function renderAdminDashboardPage({
   }
   accountPanel += '</section>';
 
-  const reportSnapshotCards = [
-    {
-      title: 'Doanh thu hôm nay',
-      value: formatDashboardRevenueByCurrency(normalizedReports.snapshot.today),
-      tone: 'green',
-    },
-    {
-      title: 'Doanh thu tháng này',
-      value: formatDashboardRevenueByCurrency(normalizedReports.snapshot.month),
-      tone: 'teal',
-    },
-    {
-      title: 'Doanh thu năm nay',
-      value: formatDashboardRevenueByCurrency(normalizedReports.snapshot.year),
-      tone: 'blue',
-    },
-  ];
-  const reportSnapshotCardsHtml = reportSnapshotCards.map((card) => [
-    `<article class="stat-card tone-${escapeHtml(card.tone)}">`,
-    `  <h3>${escapeHtml(card.title)}</h3>`,
-    `  <p class="stat-multi">${escapeHtml(card.value)}</p>`,
-    '</article>',
-  ].join('\n')).join('\n');
-
-  const reportProductRows = normalizedReports.byProduct.map((row, index) => [
-    '<tr>',
-    `  <td>${index + 1}</td>`,
-    `  <td>${escapeHtml(row.productName || '(không rõ)')}</td>`,
-    `  <td><code>${escapeHtml(row.productId || '-')}</code></td>`,
-    `  <td>${escapeHtml(String(row.totalQuantity))}</td>`,
-    `  <td>${escapeHtml(formatPriceVnd(row.totalRevenue))}</td>`,
-    `  <td>${escapeHtml(String(row.totalOrders))}</td>`,
-    `  <td>${escapeHtml(row.currency || 'VND')}</td>`,
-    '</tr>',
-  ].join('\n')).join('\n');
-
-  const buildReportPeriodRows = (rows, periodType) => rows.map((row) => [
-    '<tr>',
-    `  <td>${escapeHtml(formatDashboardPeriodLabel(row.periodKey, periodType))}</td>`,
-    `  <td>${escapeHtml(String(row.orderCount))}</td>`,
-    `  <td>${escapeHtml(formatPriceVnd(row.totalRevenue))}</td>`,
-    `  <td>${escapeHtml(row.currency || 'VND')}</td>`,
-    '</tr>',
-  ].join('\n')).join('\n');
-
-  const reportByDayRows = buildReportPeriodRows(normalizedReports.byDay, 'day');
-  const reportByMonthRows = buildReportPeriodRows(normalizedReports.byMonth, 'month');
-  const reportByYearRows = buildReportPeriodRows(normalizedReports.byYear, 'year');
-  const buildReportProductPeriodRows = (rows, periodType) => rows.map((row) => [
-    '<tr>',
-    `  <td>${escapeHtml(formatDashboardPeriodLabel(row.periodKey, periodType))}</td>`,
-    `  <td>${escapeHtml(row.productName || '(không rõ)')}</td>`,
-    `  <td><code>${escapeHtml(row.productId || '-')}</code></td>`,
-    `  <td>${escapeHtml(String(row.totalQuantity))}</td>`,
-    `  <td>${escapeHtml(String(row.totalOrders))}</td>`,
-    '</tr>',
-  ].join('\n')).join('\n');
-  const reportProductByDayRows = buildReportProductPeriodRows(normalizedReports.byProductDay, 'day');
-  const reportProductByMonthRows = buildReportProductPeriodRows(normalizedReports.byProductMonth, 'month');
-  const reportProductByYearRows = buildReportProductPeriodRows(normalizedReports.byProductYear, 'year');
   const reportFilterForm = [
     `<form class="inline-form" method="get" action="${escapeHtml(adminDashboardPath)}">`,
     '  <input type="hidden" name="tab" value="reports" />',
@@ -2781,83 +2979,250 @@ function renderAdminDashboardPage({
     '</form>',
   ].join('\n');
 
+  const productsById = new Map((Array.isArray(products) ? products : []).map((product) => [String(product.id || '').trim(), product]));
+  const reportCurrencyRows = [
+    ...normalizedReports.byDay,
+    ...normalizedReports.byMonth,
+    ...normalizedReports.byYear,
+  ];
+  const fallbackReportCurrency = normalizeDashboardCurrency(
+    normalizedReports.snapshot.today[0]?.currency
+    || normalizedReports.snapshot.month[0]?.currency
+    || normalizedReports.snapshot.year[0]?.currency
+    || 'VND',
+  );
+  const primaryReportCurrency = pickDashboardPrimaryCurrency(reportCurrencyRows, fallbackReportCurrency);
+
+  const reportRevenueByDay = aggregateDashboardRevenueRowsByPeriod(normalizedReports.byDay, primaryReportCurrency, 10);
+  const reportRevenueByMonth = aggregateDashboardRevenueRowsByPeriod(normalizedReports.byMonth, primaryReportCurrency, 10);
+  const reportRevenueByYear = aggregateDashboardRevenueRowsByPeriod(normalizedReports.byYear, primaryReportCurrency, 10);
+  const reportTypeByDay = aggregateDashboardTypeQuantityByPeriod(normalizedReports.byProductDay, productsById, 10);
+  const reportTypeByMonth = aggregateDashboardTypeQuantityByPeriod(normalizedReports.byProductMonth, productsById, 10);
+  const reportTypeByYear = aggregateDashboardTypeQuantityByPeriod(normalizedReports.byProductYear, productsById, 10);
+
+  const totalPaidOrders = normalizedReports.byDay.reduce(
+    (sum, row) => sum + Math.max(0, Math.round(parseDashboardNumber(row.orderCount))),
+    0,
+  );
+  const totalSoldQuantity = normalizedReports.byProduct.reduce(
+    (sum, row) => sum + Math.max(0, Math.round(parseDashboardNumber(row.totalQuantity))),
+    0,
+  );
+  const reportSnapshotCards = [
+    {
+      title: 'Doanh thu hôm nay',
+      value: formatDashboardRevenueByCurrency(normalizedReports.snapshot.today),
+      tone: 'green',
+      multiLine: true,
+    },
+    {
+      title: 'Doanh thu tháng này',
+      value: formatDashboardRevenueByCurrency(normalizedReports.snapshot.month),
+      tone: 'teal',
+      multiLine: true,
+    },
+    {
+      title: 'Doanh thu năm nay',
+      value: formatDashboardRevenueByCurrency(normalizedReports.snapshot.year),
+      tone: 'blue',
+      multiLine: true,
+    },
+    {
+      title: 'Đơn đã thanh toán',
+      value: String(totalPaidOrders),
+      tone: 'amber',
+      multiLine: false,
+    },
+    {
+      title: 'Tổng số lượng bán',
+      value: String(totalSoldQuantity),
+      tone: 'purple',
+      multiLine: false,
+    },
+  ];
+  const reportSnapshotCardsHtml = reportSnapshotCards.map((card) => [
+    `<article class="stat-card tone-${escapeHtml(card.tone)}">`,
+    `  <h3>${escapeHtml(card.title)}</h3>`,
+    `  <p${card.multiLine ? ' class="stat-multi"' : ''}>${escapeHtml(card.value)}</p>`,
+    '</article>',
+  ].join('\n')).join('\n');
+
+  const buildRevenueVizRows = (rows, periodType) => {
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+      return '<p class="muted-text">Không có dữ liệu trong kỳ đã lọc.</p>';
+    }
+    const maxRevenue = list.reduce((maxValue, row) => Math.max(maxValue, parseDashboardNumber(row.totalRevenue)), 0);
+    return list.map((row) => {
+      const revenue = parseDashboardNumber(row.totalRevenue);
+      const orderCount = Math.max(0, Math.round(parseDashboardNumber(row.orderCount)));
+      const barPercent = maxRevenue > 0 && revenue > 0
+        ? Math.max(8, Math.round((revenue / maxRevenue) * 100))
+        : 0;
+      return [
+        '<div class="viz-row">',
+        `  <span class="viz-label">${escapeHtml(formatDashboardPeriodLabel(row.periodKey, periodType))}</span>`,
+        `  <span class="bar-track"><span class="bar-fill" style="width:${barPercent}%"></span></span>`,
+        `  <span class="viz-value">${escapeHtml(formatPriceVnd(revenue))} ${escapeHtml(primaryReportCurrency)}<span class="muted-text">${escapeHtml(String(orderCount))} đơn</span></span>`,
+        '</div>',
+      ].join('\n');
+    }).join('\n');
+  };
+
+  const buildTypeStackRows = (rows, periodType) => {
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+      return '<p class="muted-text">Không có dữ liệu trong kỳ đã lọc.</p>';
+    }
+    return list.map((row) => {
+      const codeQty = Math.max(0, Math.round(parseDashboardNumber(row.code)));
+      const accountQty = Math.max(0, Math.round(parseDashboardNumber(row.account)));
+      const supportQty = Math.max(0, Math.round(parseDashboardNumber(row.support)));
+      const totalQty = Math.max(0, Math.round(parseDashboardNumber(row.totalQuantity)));
+      const totalOrders = Math.max(0, Math.round(parseDashboardNumber(row.totalOrders)));
+      const safeTotal = totalQty > 0 ? totalQty : 1;
+      const codeWidth = totalQty > 0 ? Math.round((codeQty / safeTotal) * 100) : 0;
+      const accountWidth = totalQty > 0 ? Math.round((accountQty / safeTotal) * 100) : 0;
+      const supportWidth = totalQty > 0 ? Math.max(0, 100 - codeWidth - accountWidth) : 0;
+      return [
+        '<div class="viz-row">',
+        `  <span class="viz-label">${escapeHtml(formatDashboardPeriodLabel(row.periodKey, periodType))}</span>`,
+        '  <span class="stack-track">',
+        `    <span class="stack-seg seg-code" style="width:${codeWidth}%"></span>`,
+        `    <span class="stack-seg seg-account" style="width:${accountWidth}%"></span>`,
+        `    <span class="stack-seg seg-support" style="width:${supportWidth}%"></span>`,
+        '  </span>',
+        `  <span class="viz-value">${escapeHtml(String(totalQty))} lượt<span class="muted-text">${escapeHtml(`code ${codeQty} | account ${accountQty} | support ${supportQty} | ${totalOrders} đơn`)}</span></span>`,
+        '</div>',
+      ].join('\n');
+    }).join('\n');
+  };
+
+  const reportTopProductRows = normalizedReports.byProduct.slice(0, 20).map((row, index) => {
+    const categoryMeta = productCategoryMeta(resolveDashboardReportCategory(row, productsById), 'vi');
+    return [
+      '<tr>',
+      `  <td>${index + 1}</td>`,
+      `  <td>${escapeHtml(row.productName || '(không rõ)')}</td>`,
+      `  <td><code>${escapeHtml(row.productId || '-')}</code></td>`,
+      `  <td><span class="tag">${escapeHtml(categoryMeta.label)}</span></td>`,
+      `  <td>${escapeHtml(String(row.totalQuantity))}</td>`,
+      `  <td>${escapeHtml(formatPriceVnd(row.totalRevenue))} ${escapeHtml(row.currency || 'VND')}</td>`,
+      `  <td>${escapeHtml(String(row.totalOrders))}</td>`,
+      '</tr>',
+    ].join('\n');
+  }).join('\n');
+
   const reportPanel = [
     '<section class="panel">',
     '  <div class="panel-head">',
     '    <div>',
-    '      <h2>Thống kê</h2>',
-    '      <p class="panel-subtitle">Báo cáo theo sản phẩm đã bán (ngày/tháng/năm) và doanh thu theo kỳ. Có thể lọc theo tên sản phẩm và khoảng ngày.</p>',
+    '      <h2>Thống kê trực quan</h2>',
+    '      <p class="panel-subtitle">Xem nhanh doanh thu và số lượng bán theo ngày/tháng/năm, ưu tiên dữ liệu dễ quét cho admin.</p>',
     '    </div>',
     `    ${reportFilterForm}`,
     '  </div>',
     `  <section class="stat-grid">${reportSnapshotCardsHtml}</section>`,
     '  <section class="report-section">',
-    '    <h3>Tổng theo sản phẩm đã bán</h3>',
-    '    <div class="table-wrap">',
-    '      <table>',
-    '        <thead><tr><th>#</th><th>Sản phẩm</th><th>Product ID</th><th>Số lượng bán</th><th>Doanh thu</th><th>Số đơn</th><th>Tiền tệ</th></tr></thead>',
-    `        <tbody>${reportProductRows || '<tr><td colspan="7">Không có dữ liệu.</td></tr>'}</tbody>`,
-    '      </table>',
-    '    </div>',
-  '  </section>',
-    '  <section class="report-section">',
-    '    <h3>Số lượng theo sản phẩm đã bán (ngày)</h3>',
-    '    <div class="table-wrap">',
-    '      <table>',
-    '        <thead><tr><th>Ngày</th><th>Sản phẩm</th><th>Product ID</th><th>Số lượng đã bán</th><th>Số đơn</th></tr></thead>',
-    `        <tbody>${reportProductByDayRows || '<tr><td colspan="5">Không có dữ liệu.</td></tr>'}</tbody>`,
-    '      </table>',
-    '    </div>',
-    '  </section>',
-    '  <section class="report-section">',
-    '    <h3>Số lượng theo sản phẩm đã bán (tháng)</h3>',
-    '    <div class="table-wrap">',
-    '      <table>',
-    '        <thead><tr><th>Tháng</th><th>Sản phẩm</th><th>Product ID</th><th>Số lượng đã bán</th><th>Số đơn</th></tr></thead>',
-    `        <tbody>${reportProductByMonthRows || '<tr><td colspan="5">Không có dữ liệu.</td></tr>'}</tbody>`,
-    '      </table>',
+    `    <h3>Doanh thu theo kỳ (${escapeHtml(primaryReportCurrency)})</h3>`,
+    '    <div class="viz-grid">',
+    '      <article class="viz-card">',
+    '        <h4>Theo ngày</h4>',
+    `        ${buildRevenueVizRows(reportRevenueByDay, 'day')}`,
+    '      </article>',
+    '      <article class="viz-card">',
+    '        <h4>Theo tháng</h4>',
+    `        ${buildRevenueVizRows(reportRevenueByMonth, 'month')}`,
+    '      </article>',
+    '      <article class="viz-card">',
+    '        <h4>Theo năm</h4>',
+    `        ${buildRevenueVizRows(reportRevenueByYear, 'year')}`,
+    '      </article>',
     '    </div>',
     '  </section>',
     '  <section class="report-section">',
-    '    <h3>Số lượng theo sản phẩm đã bán (năm)</h3>',
-    '    <div class="table-wrap">',
-    '      <table>',
-    '        <thead><tr><th>Năm</th><th>Sản phẩm</th><th>Product ID</th><th>Số lượng đã bán</th><th>Số đơn</th></tr></thead>',
-    `        <tbody>${reportProductByYearRows || '<tr><td colspan="5">Không có dữ liệu.</td></tr>'}</tbody>`,
-    '      </table>',
+    '    <h3>Cơ cấu số lượng bán theo loại hàng</h3>',
+    '    <div class="legend-row">',
+    '      <span class="tag"><span class="stack-seg seg-code"></span> Code</span>',
+    '      <span class="tag"><span class="stack-seg seg-account"></span> Account</span>',
+    '      <span class="tag"><span class="stack-seg seg-support"></span> Support</span>',
+    '    </div>',
+    '    <div class="viz-grid">',
+    '      <article class="viz-card">',
+    '        <h4>Theo ngày</h4>',
+    `        ${buildTypeStackRows(reportTypeByDay, 'day')}`,
+    '      </article>',
+    '      <article class="viz-card">',
+    '        <h4>Theo tháng</h4>',
+    `        ${buildTypeStackRows(reportTypeByMonth, 'month')}`,
+    '      </article>',
+    '      <article class="viz-card">',
+    '        <h4>Theo năm</h4>',
+    `        ${buildTypeStackRows(reportTypeByYear, 'year')}`,
+    '      </article>',
     '    </div>',
     '  </section>',
     '  <section class="report-section">',
-    '    <h3>Doanh thu theo ngày</h3>',
+    '    <h3>Top sản phẩm bán chạy</h3>',
     '    <div class="table-wrap">',
     '      <table>',
-    '        <thead><tr><th>Ngày</th><th>Số đơn</th><th>Doanh thu</th><th>Tiền tệ</th></tr></thead>',
-    `        <tbody>${reportByDayRows || '<tr><td colspan="4">Không có dữ liệu.</td></tr>'}</tbody>`,
-    '      </table>',
-    '    </div>',
-    '  </section>',
-    '  <section class="report-section">',
-    '    <h3>Doanh thu theo tháng</h3>',
-    '    <div class="table-wrap">',
-    '      <table>',
-    '        <thead><tr><th>Tháng</th><th>Số đơn</th><th>Doanh thu</th><th>Tiền tệ</th></tr></thead>',
-    `        <tbody>${reportByMonthRows || '<tr><td colspan="4">Không có dữ liệu.</td></tr>'}</tbody>`,
-    '      </table>',
-    '    </div>',
-    '  </section>',
-    '  <section class="report-section">',
-    '    <h3>Doanh thu theo năm</h3>',
-    '    <div class="table-wrap">',
-    '      <table>',
-    '        <thead><tr><th>Năm</th><th>Số đơn</th><th>Doanh thu</th><th>Tiền tệ</th></tr></thead>',
-    `        <tbody>${reportByYearRows || '<tr><td colspan="4">Không có dữ liệu.</td></tr>'}</tbody>`,
+    '        <thead><tr><th>#</th><th>Sản phẩm</th><th>Product ID</th><th>Loại</th><th>Số lượng</th><th>Doanh thu</th><th>Số đơn</th></tr></thead>',
+    `        <tbody>${reportTopProductRows || '<tr><td colspan="7">Không có dữ liệu.</td></tr>'}</tbody>`,
     '      </table>',
     '    </div>',
     '  </section>',
     '</section>',
   ].join('\n');
 
-  const mainStatGridHtml = safeTab === 'reports'
+  const notifyRows = (Array.isArray(notifyUsers) ? notifyUsers : []).map((user, index) => [
+    '<tr>',
+    `  <td>${escapeHtml(String(index + 1))}</td>`,
+    `  <td>${escapeHtml(user.displayName || '(không rõ)')}</td>`,
+    `  <td>${escapeHtml(user.username ? `@${user.username}` : '-')}</td>`,
+    `  <td><code>${escapeHtml(String(user.telegramId || '-'))}</code></td>`,
+    `  <td>${escapeHtml(String(user.role || 'customer'))}</td>`,
+    `  <td>${escapeHtml(String(user.languageCode || 'vi'))}</td>`,
+    `  <td>${escapeHtml(formatDashboardDateTime(user.createdAt))}</td>`,
+    '</tr>',
+  ].join('\n')).join('\n');
+
+  const notifyPanel = [
+    '<section class="panel">',
+    '  <div class="panel-head">',
+    '    <div>',
+    '      <h2>Thông báo người dùng</h2>',
+    '      <p class="panel-subtitle">Gửi thông báo thủ công cho một user hoặc broadcast toàn bộ user đã từng dùng bot.</p>',
+    '    </div>',
+    '  </div>',
+    `  <form class="create-form" method="post" action="${escapeHtml(`${adminDashboardPath}/notify-one`)}">`,
+    `    <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
+    `    <input type="hidden" name="account_scope" value="${escapeHtml(safeAccountScope)}" />`,
+    '    <input type="hidden" name="tab" value="notify" />',
+    '    <label>Telegram ID <input name="telegram_id" type="text" placeholder="Ví dụ: 123456789" required /></label>',
+    '    <label style="grid-column: span 3;">Nội dung <input name="message" type="text" placeholder="Nội dung tin nhắn gửi 1 user" required /></label>',
+    '    <button type="submit">Gửi 1 user</button>',
+    '  </form>',
+    `  <form class="account-form" method="post" action="${escapeHtml(`${adminDashboardPath}/notify-all`)}">`,
+    `    <input type="hidden" name="products_scope" value="${escapeHtml(safeProductScope)}" />`,
+    `    <input type="hidden" name="account_scope" value="${escapeHtml(safeAccountScope)}" />`,
+    '    <input type="hidden" name="tab" value="notify" />',
+    '    <label>Nội dung broadcast',
+    '      <textarea name="message" placeholder="Nhập nội dung gửi toàn bộ user..." required></textarea>',
+    '    </label>',
+    '    <div class="actions-row">',
+    '      <button class="btn-action btn-confirm" type="submit">Broadcast toàn bộ user</button>',
+    '    </div>',
+    '  </form>',
+    '  <div class="table-wrap">',
+    '    <table>',
+    '      <thead><tr><th>#</th><th>Tên hiển thị</th><th>Username</th><th>Telegram ID</th><th>Role</th><th>Lang</th><th>Tạo lúc</th></tr></thead>',
+    `      <tbody>${notifyRows || '<tr><td colspan="7">Chưa có user để hiển thị.</td></tr>'}</tbody>`,
+    '    </table>',
+    '  </div>',
+    '</section>',
+  ].join('\n');
+
+  const mainStatGridHtml = safeTab === 'reports' || safeTab === 'notify'
     ? ''
     : `<section class="stat-grid">${statCardsHtml}</section>`;
 
@@ -2867,6 +3232,8 @@ function renderAdminDashboardPage({
       ? accountPanel
       : safeTab === 'reports'
         ? reportPanel
+        : safeTab === 'notify'
+          ? notifyPanel
         : orderPanel;
 
   return [
@@ -2912,9 +3279,23 @@ function renderAdminDashboardPage({
     '    .panel-subtitle { margin: 5px 0 0; color: var(--muted); font-size: 14px; }',
     '    .report-section { display: grid; gap: 8px; margin-top: 12px; }',
     '    .report-section h3 { margin: 0; font-family: "Space Grotesk", sans-serif; font-size: 18px; }',
+    '    .legend-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }',
     '    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }',
     '    .chip { display: inline-flex; align-items: center; padding: 6px 11px; border-radius: 999px; border: 1px solid var(--line); color: #274765; text-decoration: none; font-size: 12px; font-weight: 600; background: #f9fcff; }',
     '    .chip.active { background: #e1fffa; border-color: #8cd5cb; color: #0a6159; }',
+    '    .viz-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 10px; }',
+    '    .viz-card { border: 1px solid #dbe7f2; border-radius: 14px; padding: 10px; background: linear-gradient(180deg, #ffffff 0%, #f9fcff 100%); display: grid; gap: 8px; align-content: start; }',
+    '    .viz-card h4 { margin: 0; font-family: "Space Grotesk", sans-serif; font-size: 16px; }',
+    '    .viz-row { display: grid; grid-template-columns: minmax(72px, 92px) minmax(120px, 1fr) minmax(120px, 180px); gap: 8px; align-items: center; }',
+    '    .viz-label { font-size: 12px; color: #334e68; font-weight: 600; }',
+    '    .viz-value { display: grid; justify-items: end; gap: 1px; text-align: right; font-size: 12px; color: #0f2437; font-weight: 600; }',
+    '    .bar-track, .stack-track { display: block; width: 100%; height: 11px; border-radius: 999px; border: 1px solid #d6e3ef; overflow: hidden; background: #eef4fb; }',
+    '    .bar-fill { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, #0f8a7f 0%, #17b59d 100%); }',
+    '    .stack-track { display: flex; gap: 0; }',
+    '    .stack-seg { display: inline-flex; height: 100%; min-width: 0; }',
+    '    .seg-code { background: #1d4ed8; }',
+    '    .seg-account { background: #0f8a7f; }',
+    '    .seg-support { background: #ff8a24; }',
     '    .table-wrap { overflow: auto; border: 1px solid #e5edf4; border-radius: 14px; }',
     '    table { width: 100%; border-collapse: collapse; min-width: 940px; }',
     '    thead th { position: sticky; top: 0; z-index: 2; background: #f8fbff; }',
@@ -2923,6 +3304,7 @@ function renderAdminDashboardPage({
     '    tbody tr:nth-child(even) { background: #fcfeff; }',
     '    .id-stack { display: grid; gap: 2px; }',
     '    .id-stack strong { font-size: 13px; }',
+    '    .muted-text { color: var(--muted); font-size: 11px; font-weight: 500; }',
     '    code { font-size: 11px; color: #47627c; }',
     '    .status-badge, .tag, .stock-badge { display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid transparent; }',
     '    .status-badge.neutral { background: #eef2f6; border-color: #d7dee6; color: #425466; }',
@@ -2931,6 +3313,7 @@ function renderAdminDashboardPage({
     '    .status-badge.paid { background: var(--ok-soft); border-color: #99e9be; color: var(--ok); }',
     '    .status-badge.cancelled { background: var(--danger-soft); border-color: #f4b8b3; color: var(--danger); }',
     '    .tag { background: #f1f6fd; border-color: #d4e1ef; color: #274765; }',
+    '    .tag .stack-seg { width: 12px; height: 10px; border-radius: 999px; margin-right: 6px; flex: none; }',
     '    .stock-badge { background: #ecfdf3; border-color: #a9e6c0; color: #067647; }',
     '    .stock-badge.low { background: #fff1ee; border-color: #f7bbb3; color: #b42318; }',
     '    .actions { display: flex; flex-wrap: wrap; gap: 6px; }',
@@ -2957,7 +3340,7 @@ function renderAdminDashboardPage({
     '    .account-form { display: grid; gap: 8px; margin-bottom: 10px; }',
     '    .actions-row { display: flex; gap: 8px; flex-wrap: wrap; }',
     '    @media (max-width: 1180px) { .create-form { grid-template-columns: 1fr 1fr; } .create-form button { grid-column: span 2; } }',
-    '    @media (max-width: 930px) { .hero h1 { font-size: 25px; } .tabs { width: 100%; justify-content: space-between; } .tab { flex: 1; text-align: center; } .panel { padding: 10px; } .create-form { grid-template-columns: 1fr; } .create-form button { grid-column: span 1; } }',
+    '    @media (max-width: 930px) { .hero h1 { font-size: 25px; } .tabs { width: 100%; justify-content: space-between; } .tab { flex: 1; text-align: center; } .panel { padding: 10px; } .create-form { grid-template-columns: 1fr; } .create-form button { grid-column: span 1; } .viz-row { grid-template-columns: 1fr; gap: 5px; } .viz-value { justify-items: start; text-align: left; } }',
   '  </style>',
     '</head>',
     '<body>',
@@ -2998,6 +3381,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
   const accountUpdatePath = `${adminDashboardPath}/account-update`;
   const accountDeletePath = `${adminDashboardPath}/account-delete`;
   const accountStatePath = `${adminDashboardPath}/account-state`;
+  const notifyOnePath = `${adminDashboardPath}/notify-one`;
+  const notifyAllPath = `${adminDashboardPath}/notify-all`;
 
   if (
     pathname !== adminDashboardPath
@@ -3012,6 +3397,8 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
     && pathname !== accountUpdatePath
     && pathname !== accountDeletePath
     && pathname !== accountStatePath
+    && pathname !== notifyOnePath
+    && pathname !== notifyAllPath
   ) {
     return false;
   }
@@ -3484,6 +3871,83 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
     }
   }
 
+  if (pathname === notifyOnePath && req.method === 'POST') {
+    const rawBody = await readRawRequestBody(req);
+    const form = parseFormUrlEncoded(rawBody);
+    const productScope = normalizeDashboardProductScope(form.products_scope);
+    const accountScope = normalizeDashboardAccountScope(form.account_scope);
+    const telegramIdRaw = String(form.telegram_id || '').trim();
+    const message = String(form.message || '').trim();
+    const telegramId = Number(telegramIdRaw);
+
+    if (!telegramIdRaw || !Number.isInteger(telegramId) || telegramId <= 0 || !message) {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'notify',
+        products_scope: productScope,
+        account_scope: accountScope,
+        err: 'Thiếu Telegram ID hoặc nội dung thông báo.',
+      }));
+      return true;
+    }
+
+    try {
+      await bot.telegram.sendMessage(telegramId, message);
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'notify',
+        products_scope: productScope,
+        account_scope: accountScope,
+        msg: `Đã gửi thông báo tới ${telegramId}.`,
+      }));
+      return true;
+    } catch (error) {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'notify',
+        products_scope: productScope,
+        account_scope: accountScope,
+        err: `Gửi tới ${telegramId} thất bại: ${String(error.message || 'unknown')}`,
+      }));
+      return true;
+    }
+  }
+
+  if (pathname === notifyAllPath && req.method === 'POST') {
+    const rawBody = await readRawRequestBody(req);
+    const form = parseFormUrlEncoded(rawBody);
+    const productScope = normalizeDashboardProductScope(form.products_scope);
+    const accountScope = normalizeDashboardAccountScope(form.account_scope);
+    const message = String(form.message || '').trim();
+
+    if (!message) {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'notify',
+        products_scope: productScope,
+        account_scope: accountScope,
+        err: 'Thiếu nội dung broadcast.',
+      }));
+      return true;
+    }
+
+    try {
+      const result = await broadcastMessageToAllKnownUsers(message);
+      const resultText = `Đã gửi broadcast: total=${result.total}, sent=${result.sent}, failed=${result.failed}`;
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'notify',
+        products_scope: productScope,
+        account_scope: accountScope,
+        msg: resultText,
+      }));
+      return true;
+    } catch (error) {
+      redirectResponse(res, buildAdminDashboardUrl({
+        tab: 'notify',
+        products_scope: productScope,
+        account_scope: accountScope,
+        err: `Broadcast thất bại: ${String(error.message || 'unknown')}`,
+      }));
+      return true;
+    }
+  }
+
   if (pathname !== adminDashboardPath || req.method !== 'GET') {
     sendJson(res, 404, { ok: false, error: 'Not found' });
     return true;
@@ -3516,6 +3980,9 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
     const reports = tab === 'reports'
       ? await loadDashboardReports(reportFilters)
       : createEmptyDashboardReports();
+    const notifyUsers = tab === 'notify'
+      ? await loadDashboardNotifyUsers(200)
+      : [];
 
     let selectedProduct = null;
     let accountSummary = null;
@@ -3540,6 +4007,7 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       selectedProduct,
       accountSummary,
       reports,
+      notifyUsers,
     });
     sendHtml(res, 200, html);
     return true;
@@ -3558,6 +4026,7 @@ async function handleAdminDashboardRequest(req, res, requestUrl) {
       selectedProduct: null,
       accountSummary: null,
       reports: createEmptyDashboardReports(),
+      notifyUsers: [],
     }));
     return true;
   }
@@ -3592,6 +4061,55 @@ async function findOrderByTransferCode(transferCode) {
   return null;
 }
 
+async function loadOrderUsageItems(orderId) {
+  const oid = String(orderId || '').trim();
+  if (!oid) {
+    return [];
+  }
+
+  const { data: orderItems, error: orderItemsError } = await db
+    .from('order_items')
+    .select('product_id,quantity')
+    .eq('order_id', oid)
+    .limit(5000);
+  if (orderItemsError) {
+    throw orderItemsError;
+  }
+
+  const rows = orderItems || [];
+  if (!rows.length) {
+    return [];
+  }
+
+  const productIds = [...new Set(rows.map((row) => String(row.product_id || '').trim()).filter(Boolean))];
+  if (!productIds.length) {
+    return [];
+  }
+
+  const { data: products, error: productsError } = await db
+    .from('products')
+    .select('id,name,description,delivery_type,manual_contact_note')
+    .in('id', productIds)
+    .limit(5000);
+  if (productsError) {
+    throw productsError;
+  }
+
+  const productMap = new Map((products || []).map((product) => [String(product.id || '').trim(), product]));
+  return rows.map((row) => {
+    const product = productMap.get(String(row.product_id || '').trim()) || null;
+    const quantityRaw = Number(row.quantity || 1);
+    const quantity = Number.isInteger(quantityRaw) && quantityRaw > 0 ? quantityRaw : 1;
+    return {
+      productName: String(product?.name || row.product_id || '').trim() || '(không rõ sản phẩm)',
+      quantity,
+      categoryKey: product ? inferProductCategoryKey(product) : 'account',
+      deliveryType: String(product?.delivery_type || '').toLowerCase(),
+      manualContactNote: String(product?.manual_contact_note || '').trim(),
+    };
+  });
+}
+
 async function notifyOrderPaid(orderId, userId, amount, currency) {
   const paidAt = new Date();
   const deliveredAt = formatDateTimeVietnam(paidAt);
@@ -3606,7 +4124,14 @@ async function notifyOrderPaid(orderId, userId, amount, currency) {
   }
 
   const buyerName = formatBuyerDisplayName(owner);
-  const invoiceText = buildPaidInvoiceMessage(orderId, amount, currency, paidAt, buyerName);
+  let usageItems = [];
+  try {
+    usageItems = await loadOrderUsageItems(orderId);
+  } catch (error) {
+    // Keep payment notification non-blocking when usage lookup fails.
+    usageItems = [];
+  }
+  const invoiceText = buildPaidInvoiceMessage(orderId, amount, currency, paidAt, buyerName, { usageItems });
 
   if (owner?.telegram_id) {
     try {
@@ -3657,7 +4182,7 @@ async function deliverAutoAccountsAfterPaid(order) {
 
   const { data: products, error: productsError } = await db
     .from('products')
-    .select('id,name,delivery_type')
+    .select('id,name,description,delivery_type,manual_contact_note')
     .in('id', productIds);
   if (productsError) {
     throw productsError;
@@ -3702,6 +4227,9 @@ async function deliverAutoAccountsAfterPaid(order) {
       sections.push({
         productName: product.name || item.product_id,
         accounts,
+        categoryKey: inferProductCategoryKey(product),
+        deliveryType: String(product.delivery_type || '').toLowerCase(),
+        manualContactNote: String(product.manual_contact_note || '').trim(),
       });
     }
 
@@ -5954,7 +6482,7 @@ function buildHelpMessage(locale, admin = false) {
       '/orders - Xem đơn hàng',
       '/me - Thông tin tài khoản',
       '/clear [so_tin] - Dọn nhanh đoạn chat gần nhất',
-      '/notifyall <noi_dung> - Gửi thông báo cho toàn bộ user',
+      `/admin - Quản trị trên dashboard (${adminDashboardPath})`,
       '/help - Trợ giúp',
     ].join('\n');
   }
@@ -5994,10 +6522,7 @@ async function registerChatMenuCommands() {
     { command: 'help', description: 'Tro giup' },
   ];
 
-  const adminCommands = [
-    ...userCommands,
-    { command: 'notifyall', description: 'Gui thong bao tat ca user' },
-  ];
+  const adminCommands = [...userCommands];
 
   try {
     await bot.telegram.setMyDescription('Mua gói dịch vụ số, thanh toán nhanh, giao hàng tự động.');
@@ -6151,12 +6676,12 @@ bot.command('language', async (ctx) => {
 bot.command('admin', async (ctx) => {
   const user = await ensureUser(ctx);
   const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
+  if (!hasAdminIdentity(ctx, user)) {
     await ctx.reply(t(locale, 'noAdmin'));
     return;
   }
 
-  await sendAdminMainPanel(ctx);
+  await ctx.reply(`Luồng admin đã chuyển sang dashboard web: ${adminDashboardPath}`);
 });
 
 bot.command('clear', async (ctx) => {
@@ -6319,7 +6844,7 @@ bot.action('admin_add_product_start', async (ctx) => {
 
 bot.command('claimadmin', async (ctx) => {
   await ensureUser(ctx);
-  await ctx.reply('Đã tắt tính năng admin trong chat bot. Chỉ còn lệnh /notifyall cho tài khoản được cấu hình.');
+  await ctx.reply(`Tính năng admin chat đã tắt. Dùng Admin Dashboard tại: ${adminDashboardPath}`);
 });
 
 async function loadAllKnownUserTelegramIds() {
@@ -6373,61 +6898,13 @@ async function broadcastMessageToAllKnownUsers(text) {
 }
 
 bot.command('notify', async (ctx) => {
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-  if (!isAdmin(ctx, user)) {
-    await ctx.reply(t(locale, 'noAdmin'));
-    return;
-  }
-
-  const payload = getCommandPayload(ctx.message.text, 'notify');
-  const [targetIdRaw, ...messageParts] = payload.split(/\s+/);
-  const targetId = Number(targetIdRaw);
-  const message = messageParts.join(' ').trim();
-
-  if (!targetIdRaw || !Number.isInteger(targetId) || !message) {
-    await ctx.reply('Dùng: /notify <telegram_id> <noi_dung>');
-    return;
-  }
-
-  try {
-    await bot.telegram.sendMessage(targetId, message);
-    await ctx.reply(`Đã gửi tin nhắn tới ${targetId}.`);
-  } catch (error) {
-    await ctx.reply(`Gửi thất bại: ${error.message}`);
-  }
+  await ensureUser(ctx);
+  await ctx.reply(`Lệnh /notify đã chuyển sang Admin Dashboard: ${adminDashboardPath}`);
 });
 
 bot.command('notifyall', async (ctx) => {
-  const user = await ensureUser(ctx);
-  const locale = getLocale(user);
-  if (!canUseNotifyAll(ctx, user)) {
-    await ctx.reply(t(locale, 'noAdmin'));
-    return;
-  }
-
-  const message = getCommandPayload(ctx.message.text, 'notifyall');
-  if (!message) {
-    await ctx.reply('Dùng: /notifyall <noi_dung>');
-    return;
-  }
-
-  await ctx.reply('Đang gửi thông báo tới toàn bộ người dùng...');
-  const result = await broadcastMessageToAllKnownUsers(message);
-
-  const lines = [
-    '📣 Kết quả notifyall',
-    `Tổng user: ${result.total}`,
-    `Gửi thành công: ${result.sent}`,
-    `Gửi thất bại: ${result.failed}`,
-  ];
-  if (result.errors.length > 0) {
-    lines.push('');
-    lines.push('Một số lỗi mẫu:');
-    lines.push(...result.errors);
-  }
-
-  await ctx.reply(lines.join('\n'));
+  await ensureUser(ctx);
+  await ctx.reply(`Lệnh /notifyall đã chuyển sang Admin Dashboard: ${adminDashboardPath}`);
 });
 
 bot.command('addproduct', async (ctx) => {
