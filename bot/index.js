@@ -65,10 +65,10 @@ const supportZaloNumber = process.env.SUPPORT_ZALO || '0563228054';
 const supportShopName = String(process.env.SUPPORT_SHOP_NAME || botDisplayName).trim() || botDisplayName;
 const supportZaloGroup = process.env.SUPPORT_ZALO_GROUP || '';
 const supportTelegramContact = process.env.SUPPORT_TELEGRAM || '';
-const paymentTimeoutSecondsRaw = Number(process.env.PAYMENT_TIMEOUT_SECONDS || 300);
+const paymentTimeoutSecondsRaw = Number(process.env.PAYMENT_TIMEOUT_SECONDS || 600);
 const paymentTimeoutSeconds = Number.isFinite(paymentTimeoutSecondsRaw) && paymentTimeoutSecondsRaw > 0
   ? Math.round(paymentTimeoutSecondsRaw)
-  : 300;
+  : 600;
 const paymentTimeoutMs = paymentTimeoutSeconds * 1000;
 const orderExpirySweepIntervalMsRaw = Number(process.env.ORDER_EXPIRY_SWEEP_INTERVAL_MS || 15000);
 const orderExpirySweepIntervalMs = Number.isFinite(orderExpirySweepIntervalMsRaw) && orderExpirySweepIntervalMsRaw >= 5000
