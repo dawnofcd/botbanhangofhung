@@ -49,8 +49,10 @@ const supportZaloNumber = process.env.SUPPORT_ZALO || '0563228054';
 const supportShopName = String(process.env.SUPPORT_SHOP_NAME || botDisplayName).trim() || botDisplayName;
 const supportZaloGroup = process.env.SUPPORT_ZALO_GROUP || '';
 const supportTelegramContact = process.env.SUPPORT_TELEGRAM || '';
-// Business rule: unpaid orders are auto-removed after exactly 60 seconds.
-const paymentTimeoutSeconds = 60;
+const paymentTimeoutSecondsRaw = Number(process.env.PAYMENT_TIMEOUT_SECONDS || 300);
+const paymentTimeoutSeconds = Number.isFinite(paymentTimeoutSecondsRaw) && paymentTimeoutSecondsRaw > 0
+  ? Math.round(paymentTimeoutSecondsRaw)
+  : 300;
 const paymentTimeoutMs = paymentTimeoutSeconds * 1000;
 const orderExpirySweepIntervalMsRaw = Number(process.env.ORDER_EXPIRY_SWEEP_INTERVAL_MS || 15000);
 const orderExpirySweepIntervalMs = Number.isFinite(orderExpirySweepIntervalMsRaw) && orderExpirySweepIntervalMsRaw >= 5000
@@ -74,6 +76,22 @@ const adminTelegramIds = new Set(
     .map((id) => id.trim())
     .filter(Boolean),
 );
+
+function formatPaymentTimeoutLabel(seconds) {
+  const safeSeconds = Math.max(1, Math.round(Number(seconds) || 0));
+  if (safeSeconds % 60 === 0) {
+    const minutes = safeSeconds / 60;
+    return `${minutes} phút`;
+  }
+  if (safeSeconds > 60) {
+    const minutes = Math.floor(safeSeconds / 60);
+    const remainingSeconds = safeSeconds % 60;
+    return `${minutes} phút ${remainingSeconds} giây`;
+  }
+  return `${safeSeconds} giây`;
+}
+
+const paymentTimeoutLabel = formatPaymentTimeoutLabel(paymentTimeoutSeconds);
 
 if (!botToken || !databaseUrl) {
   throw new Error('TELEGRAM_TOKEN and DATABASE_URL must be defined.');
@@ -331,7 +349,7 @@ async function expireUnpaidOrder(orderId) {
     if (owner?.telegram_id) {
       await bot.telegram.sendMessage(
         Number(owner.telegram_id),
-        `Đơn #${deletedOrder.id} đã tự xóa do quá ${paymentTimeoutSeconds} giây chưa thanh toán.`,
+        `Đơn #${deletedOrder.id} đã tự xóa do quá ${paymentTimeoutLabel} chưa thanh toán.`,
       );
     }
   } catch (error) {
@@ -427,7 +445,7 @@ async function recoverOverdueOrderStockAndDelete(orderId) {
     if (owner?.telegram_id) {
       await bot.telegram.sendMessage(
         Number(owner.telegram_id),
-        `Đơn #${deletedOrder.id} đã tự xóa do quá ${paymentTimeoutSeconds} giây chưa thanh toán.`,
+        `Đơn #${deletedOrder.id} đã tự xóa do quá ${paymentTimeoutLabel} chưa thanh toán.`,
       );
     }
   } catch (error) {
@@ -4051,6 +4069,11 @@ async function findOrderByTransferCode(transferCode) {
   if (!normalizedCode) {
     return null;
   }
+  const fallbackParsedCode = extractTransferCodeFromText(normalizedCode);
+  const candidateCodes = new Set([normalizedCode]);
+  if (fallbackParsedCode) {
+    candidateCodes.add(String(fallbackParsedCode || '').trim().toUpperCase());
+  }
 
   const { data, error } = await db
     .from('orders')
@@ -4067,7 +4090,7 @@ async function findOrderByTransferCode(transferCode) {
   for (const row of rows) {
     const currentCode = buildPaymentTransferCode(row.id).toUpperCase();
     const legacyCode = `DH${String(row.id || '').replace(/-/g, '').slice(0, 10).toUpperCase()}`;
-    if (currentCode === normalizedCode || legacyCode === normalizedCode) {
+    if (candidateCodes.has(currentCode) || candidateCodes.has(legacyCode)) {
       return row;
     }
   }
@@ -5796,6 +5819,11 @@ function buildPaymentTransferCode(orderId) {
   return compact.slice(0, 8).toUpperCase();
 }
 
+function buildSepayTransferContent(orderId) {
+  const code = buildPaymentTransferCode(orderId);
+  return code ? `SEVQR${code}` : '';
+}
+
 function buildSupportOrderCode(orderId) {
   const short = buildPaymentTransferCode(orderId);
   if (!short) {
@@ -5809,6 +5837,19 @@ function extractTransferCodeFromText(text) {
   const oldStyle = normalized.match(/DH[A-Z0-9]{4,20}/);
   if (oldStyle) {
     return oldStyle[0];
+  }
+  const sepayStyle = normalized.match(/SEVQR[\s:_-]*([A-Z0-9]{4,24})/);
+  if (sepayStyle?.[1]) {
+    const candidate = sepayStyle[1];
+    if (/^DH[A-Z0-9]{4,20}$/.test(candidate)) {
+      return candidate;
+    }
+    if (/^[A-Z0-9]{8}$/.test(candidate)) {
+      return candidate;
+    }
+    if (candidate.length > 8) {
+      return candidate.slice(0, 8);
+    }
   }
   const shortStyle = normalized.match(/\b[A-F0-9]{8}\b/);
   return shortStyle ? shortStyle[0] : null;
@@ -5980,7 +6021,7 @@ function buildVietQrUrl({ bankCode, accountNo, accountName, amount, transferCont
 }
 
 function buildSepayInstruction(order) {
-  const transferContent = buildPaymentTransferCode(order.id);
+  const transferContent = buildSepayTransferContent(order.id);
   const amount = Number(order.total_amount || 0);
   const qrUrl = buildVietQrUrl({
     bankCode: sepayBankCode,
@@ -5999,8 +6040,8 @@ function buildSepayInstruction(order) {
     `Số tài khoản: ${sepayAccountNo || '(chưa cấu hình)'}`,
     `Chủ TK: ${sepayAccountName || '(không bắt buộc)'}`,
     `Số tiền: ${formatPriceVnd(amount)} ${order.currency || 'VND'}`,
-    `Nội dung CK: ${transferContent.toLowerCase()}`,
-    `⏱ Tự xóa sau ${paymentTimeoutSeconds}s nếu chưa thanh toán`,
+    `Nội dung CK: ${transferContent}`,
+    `⏱ Tự xóa sau ${paymentTimeoutLabel} nếu chưa thanh toán`,
     '━━━━━━━━━━━━━━━━━━',
   ];
 
@@ -6014,7 +6055,7 @@ function buildSepayInstruction(order) {
 }
 
 function buildOrderCreatedMessage(order, product, quantity, unitPrice) {
-  const transferContent = String(order?.id || '').trim().split('-')[0] || buildPaymentTransferCode(order?.id);
+  const transferContent = buildSepayTransferContent(order?.id) || buildPaymentTransferCode(order?.id);
   const supportCode = buildSupportOrderCode(order?.id);
   const currency = order?.currency || 'VND';
   const total = Number(order?.total_amount || 0);
@@ -6038,7 +6079,7 @@ function buildOrderCreatedMessage(order, product, quantity, unitPrice) {
     `💰 Tổng tiền: ${formatPriceVnd(total)} ${currency}`,
     '',
     '💳 Vui lòng chuyển khoản đúng nội dung:',
-    transferContent.toLowerCase(),
+    transferContent,
     '',
   ];
 
@@ -7206,7 +7247,7 @@ bot.action(/^paydone:(.+)$/, async (ctx) => {
     return;
   }
 
-  const transferContent = buildPaymentTransferCode(order.id);
+  const transferContent = buildSepayTransferContent(order.id) || buildPaymentTransferCode(order.id);
   await ctx.answerCbQuery(locale === 'en' ? 'Sent to admin' : 'Đã báo admin');
   const confirmation = locale === 'en'
     ? `Payment notice sent. Admin will verify your transfer.\nOrder: #${order.id}\nTransfer content: ${transferContent}`
@@ -7234,7 +7275,7 @@ bot.action(/^paydone:(.+)$/, async (ctx) => {
 bot.action(/^paycancel:(.+)$/, async (ctx) => {
   await safeAnswerCbQuery(
     ctx,
-    'Nút hủy đơn đã bị tắt. Đơn sẽ tự hủy sau 60 giây nếu chưa thanh toán.',
+    `Nút hủy đơn đã bị tắt. Đơn sẽ tự hủy sau ${paymentTimeoutLabel} nếu chưa thanh toán.`,
     { show_alert: true },
   );
 });

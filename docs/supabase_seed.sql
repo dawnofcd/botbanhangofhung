@@ -41,7 +41,7 @@ join (
       'Tai khoan giao tu dong sau khi dat.',
       'auto',
       null,
-      89000::numeric,
+      2000::numeric,
       'VND',
       20,
       true
@@ -52,7 +52,7 @@ join (
       'Loai nay khong auto. Admin xu ly thu cong.',
       'manual',
       'Sau khi chuyen khoan thanh cong, vui long nhan admin de cung cap thong tin tai khoan.',
-      149000::numeric,
+      2000::numeric,
       'VND',
       999,
       true
@@ -63,7 +63,7 @@ join (
       'San pham mau dang tam an de test admin panel.',
       'manual',
       'Nhan admin de duoc cap thong tin sau khi thanh toan.',
-      40000::numeric,
+      2000::numeric,
       'VND',
       297,
       false

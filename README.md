@@ -19,7 +19,7 @@ Run Telegram sales bot on Railway (long polling) and store data in PostgreSQL.
 - `SEPAY_BANK_CODE`
 - `SEPAY_ACCOUNT_NAME`
 - `SEPAY_WEBHOOK_PATH` (default: `/sepay/webhook`)
-- `PAYMENT_TIMEOUT_SECONDS` (optional, default `60`)
+- `PAYMENT_TIMEOUT_SECONDS` (optional, default `300` = 5 minutes)
 - `ORDER_EXPIRY_SWEEP_INTERVAL_MS` (optional, default `15000`, min `5000`)
 - `BOT_DISPLAY_NAME` (default: `Tai nguyen By DawnMmo`)
 - `BOT_DESCRIPTION`
